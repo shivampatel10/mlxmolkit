@@ -30,6 +30,11 @@ dependencies = [
 dev = [
     "pytest>=9.0.2",
 ]
+docs = [
+    "sphinx>=8.0",
+    "furo",
+    "sphinx-autodoc-typehints",
+]
 
 [project.urls]
 Homepage = "https://github.com/shivampatel10/mlxmolkit"

@@ -708,8 +708,23 @@ _MSL_SOURCE = """
 """
 
 
-def _pack_etk_inputs(system, use_basic_knowledge, max_iters, grad_tol):
-    """Pack BatchedETKSystem into kernel input arrays."""
+def _pack_etk_inputs(
+    system: BatchedETKSystem,
+    use_basic_knowledge: bool,
+    max_iters: int,
+    grad_tol: float,
+) -> dict[str, mx.array | int]:
+    """Pack a BatchedETKSystem into flat arrays for the Metal kernel.
+
+    Args:
+        system: Batched ETK system containing all energy terms.
+        use_basic_knowledge: Whether to include improper torsion terms.
+        max_iters: Maximum number of BFGS iterations.
+        grad_tol: Gradient convergence tolerance.
+
+    Returns:
+        Dictionary of kernel input arrays and scalar sizes.
+    """
     dim = system.dim
     n_mols = system.n_mols
     atom_starts = system.atom_starts
@@ -856,23 +871,27 @@ def _pack_etk_inputs(system, use_basic_knowledge, max_iters, grad_tol):
 
 
 def metal_etk_bfgs(
-    pos,
-    system,
-    use_basic_knowledge=True,
-    max_iters=300,
-    grad_tol=None,
-):
-    """Run ETK BFGS minimization via Metal kernel.
+    pos: mx.array,
+    system: BatchedETKSystem,
+    use_basic_knowledge: bool = True,
+    max_iters: int = 300,
+    grad_tol: float | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Run ETK BFGS minimization entirely on-device via a Metal kernel.
 
     Args:
-        pos: Initial flat positions, shape (n_atoms_total * dim,), float32.
-        system: BatchedETKSystem with all terms.
-        use_basic_knowledge: Include improper torsion terms.
-        max_iters: Maximum BFGS iterations.
-        grad_tol: Gradient convergence tolerance.
+        pos: Initial flat positions, shape ``(n_atoms_total * dim,)``, float32.
+        system: Batched ETK system with all energy terms pre-packed.
+        use_basic_knowledge: Whether to include improper torsion terms.
+        max_iters: Maximum number of BFGS iterations per molecule.
+        grad_tol: Gradient convergence tolerance. Defaults to
+            ``DEFAULT_GRAD_TOL``.
 
     Returns:
-        (final_pos, final_energies, statuses)
+        Tuple of ``(final_pos, final_energies, statuses)`` where
+        *final_pos* has the same shape as *pos*, *final_energies* is
+        shape ``(n_mols,)`` float32, and *statuses* is shape ``(n_mols,)``
+        int32 (0 = converged, 1 = active/not converged).
     """
     if grad_tol is None:
         grad_tol = DEFAULT_GRAD_TOL

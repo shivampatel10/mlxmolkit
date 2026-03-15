@@ -15,6 +15,8 @@ Algorithm:
    e. New direction = -H^-1 @ grad
 """
 
+from typing import Callable
+
 import mlx.core as mx
 
 # ---------------------
@@ -31,19 +33,26 @@ GRAD_CAP = 10.0
 DEFAULT_GRAD_TOL = 1e-3  # nvMolKit: 1e-4, loosened for float32
 
 
-def _scale_grad(grad, atom_starts, n_mols, dim, grad_scale, pre_loop):
+def _scale_grad(
+    grad: mx.array,
+    atom_starts: list[int],
+    n_mols: int,
+    dim: int,
+    grad_scale: mx.array,
+    pre_loop: bool,
+) -> tuple[mx.array, mx.array]:
     """Scale gradient per-molecule: multiply by grad_scale, halve while max > 10.
 
     Args:
-        grad: Flat gradient array (n_atoms_total * dim,).
-        atom_starts: (n_mols + 1,) CSR atom boundaries (as Python list/numpy for indexing).
+        grad: Flat gradient array, shape ``(n_atoms_total * dim,)``.
+        atom_starts: CSR atom boundaries of length ``n_mols + 1``.
         n_mols: Number of molecules.
         dim: Coordinate dimension.
-        grad_scale: (n_mols,) per-molecule scale factors.
+        grad_scale: Per-molecule scale factors, shape ``(n_mols,)``.
         pre_loop: If True, initialize scale to 0.1 first.
 
     Returns:
-        (scaled_grad, grad_scale) — updated arrays.
+        Tuple of ``(scaled_grad, grad_scale)`` with updated arrays.
     """
     grad_r = grad.reshape(-1, dim)
     new_grad = grad_r * 1  # MLX copy
@@ -73,11 +82,22 @@ def _scale_grad(grad, atom_starts, n_mols, dim, grad_scale, pre_loop):
     return new_grad.reshape(-1), grad_scale
 
 
-def _compute_max_step(pos, atom_starts, n_mols, dim):
-    """Compute max step size per molecule: 100 * max(||pos||, n_terms).
+def _compute_max_step(
+    pos: mx.array,
+    atom_starts: list[int],
+    n_mols: int,
+    dim: int,
+) -> mx.array:
+    """Compute max step size per molecule: ``100 * max(||pos||, n_terms)``.
+
+    Args:
+        pos: Flat positions array, shape ``(n_atoms_total * dim,)``.
+        atom_starts: CSR atom boundaries of length ``n_mols + 1``.
+        n_mols: Number of molecules.
+        dim: Coordinate dimension.
 
     Returns:
-        (n_mols,) float32 array of max step sizes.
+        Per-molecule max step sizes, shape ``(n_mols,)``.
     """
     max_steps = mx.zeros(n_mols, dtype=mx.float32)
     pos_r = pos.reshape(-1, dim)
@@ -94,32 +114,31 @@ def _compute_max_step(pos, atom_starts, n_mols, dim):
 
 
 def bfgs_minimize(
-    energy_and_grad_fn,
-    pos,
-    atom_starts_list,
-    n_mols,
-    dim,
-    max_iters=400,
-    grad_tol=None,
-    scale_grads=True,
-):
+    energy_and_grad_fn: Callable[[mx.array], tuple[mx.array, mx.array]],
+    pos: mx.array,
+    atom_starts_list: list[int] | mx.array,
+    n_mols: int,
+    dim: int,
+    max_iters: int = 400,
+    grad_tol: float | None = None,
+    scale_grads: bool = True,
+) -> tuple[mx.array, mx.array, mx.array]:
     """Batched BFGS minimizer.
 
     Args:
-        energy_and_grad_fn: Callable(pos) -> (energies (n_mols,), grad (flat,)).
-        pos: Initial flat positions, shape (n_atoms_total * dim,), float32.
-        atom_starts_list: List/array of n_mols+1 ints — CSR atom boundaries.
+        energy_and_grad_fn: Callable taking flat positions and returning
+            ``(energies, grad)`` with shapes ``(n_mols,)`` and ``(flat,)``.
+        pos: Initial flat positions, shape ``(n_atoms_total * dim,)``, float32.
+        atom_starts_list: CSR atom boundaries of length ``n_mols + 1``.
         n_mols: Number of molecules.
         dim: Coordinate dimension (3 or 4).
         max_iters: Maximum BFGS iterations.
-        grad_tol: Gradient convergence tolerance. Default: 1e-3.
+        grad_tol: Gradient convergence tolerance. Defaults to ``1e-3``.
         scale_grads: Whether to apply gradient scaling (RDKit compat).
 
     Returns:
-        (final_pos, final_energies, statuses) where:
-            final_pos: Optimized flat positions.
-            final_energies: Per-molecule energies (n_mols,).
-            statuses: (n_mols,) int — 0=converged, 1=not converged.
+        Tuple of ``(final_pos, final_energies, statuses)`` where statuses is
+        ``(n_mols,)`` int with 0=converged, 1=not converged.
     """
     if grad_tol is None:
         grad_tol = DEFAULT_GRAD_TOL
@@ -214,13 +233,37 @@ def bfgs_minimize(
 
 
 def _line_search(
-    energy_and_grad_fn, pos, grad, direction, energies,
-    atom_starts, n_mols, dim, mol_dims, max_steps, statuses,
-):
+    energy_and_grad_fn: Callable[[mx.array], tuple[mx.array, mx.array]],
+    pos: mx.array,
+    grad: mx.array,
+    direction: mx.array,
+    energies: mx.array,
+    atom_starts: list[int],
+    n_mols: int,
+    dim: int,
+    mol_dims: list[int],
+    max_steps: mx.array,
+    statuses: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     """Backtracking line search with quadratic/cubic interpolation.
 
+    Args:
+        energy_and_grad_fn: Callable taking flat positions and returning
+            ``(energies, grad)``.
+        pos: Flat positions, shape ``(n_atoms_total * dim,)``.
+        grad: Flat gradient, shape ``(n_atoms_total * dim,)``.
+        direction: Search direction, flat array.
+        energies: Current per-molecule energies, shape ``(n_mols,)``.
+        atom_starts: CSR atom boundaries of length ``n_mols + 1``.
+        n_mols: Number of molecules.
+        dim: Coordinate dimension.
+        mol_dims: Number of coordinate terms per molecule.
+        max_steps: Per-molecule max step sizes, shape ``(n_mols,)``.
+        statuses: Per-molecule convergence statuses, shape ``(n_mols,)``.
+
     Returns:
-        (new_pos, new_energies, xi, statuses) where xi = new_pos - old_pos.
+        Tuple of ``(new_pos, new_energies, xi, statuses)`` where
+        ``xi = new_pos - old_pos``.
     """
     old_pos = pos
     old_energies = energies
@@ -388,16 +431,52 @@ def _line_search(
     return best_pos, final_energies, xi, statuses
 
 
-def _copy_mol_pos(dest, src, atom_starts, mol_idx, dim):
-    """Copy one molecule's positions from src to dest."""
+def _copy_mol_pos(
+    dest: mx.array,
+    src: mx.array,
+    atom_starts: list[int],
+    mol_idx: int,
+    dim: int,
+) -> mx.array:
+    """Copy one molecule's positions from src to dest.
+
+    Args:
+        dest: Destination flat positions array.
+        src: Source flat positions array.
+        atom_starts: CSR atom boundaries.
+        mol_idx: Index of the molecule to copy.
+        dim: Coordinate dimension.
+
+    Returns:
+        Updated destination array with the molecule's positions replaced.
+    """
     start = atom_starts[mol_idx] * dim
     end = atom_starts[mol_idx + 1] * dim
     dest = dest.at[start:end].add(src[start:end] - dest[start:end])
     return dest
 
 
-def _check_tolx(pos, xi, atom_starts, n_mols, dim, statuses):
-    """Check position change convergence (TOLX)."""
+def _check_tolx(
+    pos: mx.array,
+    xi: mx.array,
+    atom_starts: list[int],
+    n_mols: int,
+    dim: int,
+    statuses: mx.array,
+) -> mx.array:
+    """Check position change convergence against TOLX threshold.
+
+    Args:
+        pos: Current flat positions, shape ``(n_atoms_total * dim,)``.
+        xi: Step taken (new_pos - old_pos), flat array.
+        atom_starts: CSR atom boundaries of length ``n_mols + 1``.
+        n_mols: Number of molecules.
+        dim: Coordinate dimension.
+        statuses: Per-molecule convergence statuses, shape ``(n_mols,)``.
+
+    Returns:
+        Updated statuses array with newly converged molecules set to 0.
+    """
     for mol_idx in range(n_mols):
         if statuses[mol_idx].item() == 0:
             continue
@@ -415,9 +494,32 @@ def _check_tolx(pos, xi, atom_starts, n_mols, dim, statuses):
 
 
 def _check_grad_convergence(
-    grad, pos, energies, grad_scale, atom_starts, n_mols, dim, grad_tol, statuses,
-):
-    """Check gradient convergence."""
+    grad: mx.array,
+    pos: mx.array,
+    energies: mx.array,
+    grad_scale: mx.array,
+    atom_starts: list[int],
+    n_mols: int,
+    dim: int,
+    grad_tol: float,
+    statuses: mx.array,
+) -> mx.array:
+    """Check gradient convergence against tolerance.
+
+    Args:
+        grad: Current flat gradient, shape ``(n_atoms_total * dim,)``.
+        pos: Current flat positions, shape ``(n_atoms_total * dim,)``.
+        energies: Per-molecule energies, shape ``(n_mols,)``.
+        grad_scale: Per-molecule gradient scale factors, shape ``(n_mols,)``.
+        atom_starts: CSR atom boundaries of length ``n_mols + 1``.
+        n_mols: Number of molecules.
+        dim: Coordinate dimension.
+        grad_tol: Gradient convergence tolerance.
+        statuses: Per-molecule convergence statuses, shape ``(n_mols,)``.
+
+    Returns:
+        Updated statuses array with newly converged molecules set to 0.
+    """
     for mol_idx in range(n_mols):
         if statuses[mol_idx].item() == 0:
             continue
@@ -441,24 +543,32 @@ def _check_grad_convergence(
 
 
 def _bfgs_hessian_update(
-    xi, d_grad, grad, inv_hessians,
-    atom_starts, n_mols, dim, mol_dims, statuses,
-):
-    """BFGS rank-2 inverse Hessian update + compute new direction.
+    xi: mx.array,
+    d_grad: mx.array,
+    grad: mx.array,
+    inv_hessians: list[mx.array],
+    atom_starts: list[int],
+    n_mols: int,
+    dim: int,
+    mol_dims: list[int],
+    statuses: mx.array,
+) -> tuple[list[mx.array], mx.array]:
+    """BFGS rank-2 inverse Hessian update and compute new search direction.
 
     Args:
         xi: Step taken (new_pos - old_pos), flat array.
         d_grad: Gradient difference (grad_new - grad_old), flat array.
         grad: Current gradient, flat array.
-        inv_hessians: List of per-molecule (d, d) inverse Hessian matrices.
-        atom_starts: CSR atom boundaries.
+        inv_hessians: Per-molecule inverse Hessian matrices, each ``(d, d)``.
+        atom_starts: CSR atom boundaries of length ``n_mols + 1``.
         n_mols: Number of molecules.
         dim: Coordinate dimension.
-        mol_dims: List of n_terms per molecule.
-        statuses: (n_mols,) convergence statuses.
+        mol_dims: Number of coordinate terms per molecule.
+        statuses: Per-molecule convergence statuses, shape ``(n_mols,)``.
 
     Returns:
-        (inv_hessians, direction) — updated inverse Hessians and new search direction.
+        Tuple of ``(inv_hessians, direction)`` with updated inverse Hessians
+        and new search direction as a flat array.
     """
     direction = mx.zeros_like(grad)
 

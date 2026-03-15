@@ -805,8 +805,25 @@ _MSL_SOURCE = """
 """
 
 
-def _pack_etk_inputs(system, use_basic_knowledge, max_iters, grad_tol, lbfgs_m):
-    """Pack BatchedETKSystem into kernel input arrays."""
+def _pack_etk_inputs(
+    system: BatchedETKSystem,
+    use_basic_knowledge: bool,
+    max_iters: int,
+    grad_tol: float,
+    lbfgs_m: int,
+) -> dict[str, mx.array | int]:
+    """Pack a BatchedETKSystem into flat arrays for the Metal kernel.
+
+    Args:
+        system: Batched ETK system containing all energy terms.
+        use_basic_knowledge: Whether to include improper torsion terms.
+        max_iters: Maximum number of L-BFGS iterations.
+        grad_tol: Gradient convergence tolerance.
+        lbfgs_m: L-BFGS history depth (number of stored vector pairs).
+
+    Returns:
+        Dictionary of kernel input arrays and scalar sizes.
+    """
     dim = system.dim
     n_mols = system.n_mols
     atom_starts = system.atom_starts
@@ -947,27 +964,31 @@ def _pack_etk_inputs(system, use_basic_knowledge, max_iters, grad_tol, lbfgs_m):
 
 
 def metal_etk_lbfgs(
-    pos,
-    system,
-    use_basic_knowledge=True,
-    max_iters=300,
-    grad_tol=None,
-    tpm=DEFAULT_TPM,
-    lbfgs_m=DEFAULT_LBFGS_M,
-):
-    """Run ETK L-BFGS minimization via Metal kernel with threadgroup parallelism.
+    pos: mx.array,
+    system: BatchedETKSystem,
+    use_basic_knowledge: bool = True,
+    max_iters: int = 300,
+    grad_tol: float | None = None,
+    tpm: int = DEFAULT_TPM,
+    lbfgs_m: int = DEFAULT_LBFGS_M,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Run ETK L-BFGS minimization on-device with threadgroup parallelism.
 
     Args:
-        pos: Initial flat positions, shape (n_atoms_total * dim,), float32.
-        system: BatchedETKSystem with all terms.
-        use_basic_knowledge: Include improper torsion terms.
-        max_iters: Maximum L-BFGS iterations.
-        grad_tol: Gradient convergence tolerance.
-        tpm: Threads per molecule (must be power of 2).
-        lbfgs_m: L-BFGS history depth.
+        pos: Initial flat positions, shape ``(n_atoms_total * dim,)``, float32.
+        system: Batched ETK system with all energy terms pre-packed.
+        use_basic_knowledge: Whether to include improper torsion terms.
+        max_iters: Maximum number of L-BFGS iterations per molecule.
+        grad_tol: Gradient convergence tolerance. Defaults to
+            ``DEFAULT_GRAD_TOL``.
+        tpm: Threads per molecule (must be a power of 2, e.g. 1, 8, 32).
+        lbfgs_m: L-BFGS history depth (number of stored vector pairs).
 
     Returns:
-        (final_pos, final_energies, statuses)
+        Tuple of ``(final_pos, final_energies, statuses)`` where
+        *final_pos* has the same shape as *pos*, *final_energies* is
+        shape ``(n_mols,)`` float32, and *statuses* is shape ``(n_mols,)``
+        int32 (0 = converged, 1 = active/not converged).
     """
     if grad_tol is None:
         grad_tol = DEFAULT_GRAD_TOL

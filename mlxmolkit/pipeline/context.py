@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 import numpy as np
 from rdkit import Chem
+from rdkit.Chem import rdDistGeom
 
 from ..preprocessing.batching import BatchedDGSystem, batch_dg_params
 from ..preprocessing.etk_batching import BatchedETKSystem, batch_etk_params
@@ -71,7 +72,7 @@ class PipelineContext:
     # Bounds matrices (per-molecule, for chiral dist matrix check)
     bounds_matrices: list | None = None
 
-    def collect_failures(self):
+    def collect_failures(self) -> None:
         """Deactivate failed molecules. Call after each stage."""
         for i in range(self.n_mols):
             if self.failed[i]:
@@ -87,7 +88,15 @@ def _batch_tetrahedral_terms(
     terms_list: list[TetrahedralCheckTerms],
     atom_starts_np: np.ndarray,
 ) -> BatchedTetrahedralData | None:
-    """Batch per-molecule tetrahedral check terms with atom offset."""
+    """Batch per-molecule tetrahedral check terms with atom offset.
+
+    Args:
+        terms_list: Per-molecule tetrahedral check terms.
+        atom_starts_np: Cumulative atom start indices.
+
+    Returns:
+        Batched tetrahedral data with global atom indices, or None if empty.
+    """
     idx0_parts = []
     idx1_parts = []
     idx2_parts = []
@@ -123,11 +132,18 @@ def _batch_tetrahedral_terms(
     )
 
 
-def _extract_double_bond_data(mols, atom_starts):
+def _extract_double_bond_data(
+    mols: list[Chem.Mol], atom_starts: list[int]
+) -> dict[str, np.ndarray] | None:
     """Extract double bond geometry check data from molecules.
 
-    Returns dict with idx0, idx1, idx2, mol_indices arrays for the
-    double bond linearity check.
+    Args:
+        mols: RDKit molecules.
+        atom_starts: Cumulative atom start indices.
+
+    Returns:
+        Dict with 'idx0', 'idx1', 'idx2', 'mol_indices' arrays, or None
+        if no double bonds found.
     """
     idx0_list, idx1_list, idx2_list, mol_list = [], [], [], []
 
@@ -159,10 +175,18 @@ def _extract_double_bond_data(mols, atom_starts):
     }
 
 
-def _extract_stereo_bond_data(mols, atom_starts):
+def _extract_stereo_bond_data(
+    mols: list[Chem.Mol], atom_starts: list[int]
+) -> dict[str, np.ndarray] | None:
     """Extract double bond stereo check data from molecules.
 
-    Returns dict with idx0-idx3, signs, mol_indices arrays.
+    Args:
+        mols: RDKit molecules.
+        atom_starts: Cumulative atom start indices.
+
+    Returns:
+        Dict with 'idx0'-'idx3', 'signs', 'mol_indices' arrays, or None
+        if no stereo bonds found.
     """
     idx0_list, idx1_list, idx2_list, idx3_list = [], [], [], []
     signs_list, mol_list = [], []
@@ -215,11 +239,26 @@ def _extract_stereo_bond_data(mols, atom_starts):
     }
 
 
-def _extract_chiral_dist_data(mols, bounds_matrices, atom_starts, dg_system):
+def _extract_chiral_dist_data(
+    mols: list[Chem.Mol],
+    bounds_matrices: list[np.ndarray],
+    atom_starts: list[int],
+    dg_system: BatchedDGSystem,
+) -> dict[str, np.ndarray] | None:
     """Extract chiral distance matrix check data.
 
-    For each chiral center, collects all pairwise distances between
-    atoms involved in chirality and checks against bounds matrix.
+    Collects all pairwise distances between atoms involved in chirality
+    for each chiral center and looks up their bounds.
+
+    Args:
+        mols: RDKit molecules.
+        bounds_matrices: Per-molecule distance bounds matrices.
+        atom_starts: Cumulative atom start indices.
+        dg_system: Batched DG system with chiral atom indices.
+
+    Returns:
+        Dict with 'idx0', 'idx1', 'lower', 'upper', 'mol_indices' arrays,
+        or None if no chiral centers found.
     """
     idx0_list, idx1_list = [], []
     lower_list, upper_list = [], []
@@ -278,7 +317,7 @@ def create_pipeline_context(
     mols: list[Chem.Mol],
     dim: int = 4,
     basin_size_tol: float = 1e8,
-    params=None,
+    params: "rdDistGeom.EmbedParameters | None" = None,
     use_etk: bool = False,
     enforce_chirality: bool = True,
 ) -> PipelineContext:

@@ -14,12 +14,11 @@ def stage_coordgen(
     ctx: PipelineContext,
     seed: int | None = None,
     box_size_mult: float = 2.0,
-):
+) -> None:
     """Generate random 4D coordinates for all molecules.
 
-    Matches nvMolKit's random coordinate generation:
-      pos[atom, dim] = (random() - 0.5) * box_size
-    where box_size = 5.0 * box_size_mult.
+    Each coordinate is sampled uniformly from ``[-box_size/2, box_size/2]``
+    where ``box_size = 5.0 * box_size_mult``.
 
     Args:
         ctx: Pipeline context (modified in place).

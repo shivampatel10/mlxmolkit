@@ -630,9 +630,28 @@ _MSL_SOURCE = """
 """
 
 
-def _pack_kernel_inputs(system, chiral_weight, fourth_dim_weight, max_iters,
-                        grad_tol, lbfgs_m):
-    """Pack BatchedDGSystem fields into kernel input arrays."""
+def _pack_kernel_inputs(
+    system: BatchedDGSystem,
+    chiral_weight: float,
+    fourth_dim_weight: float,
+    max_iters: int,
+    grad_tol: float,
+    lbfgs_m: int,
+) -> dict[str, mx.array | int]:
+    """Pack BatchedDGSystem fields into flat arrays for the Metal kernel.
+
+    Args:
+        system: Batched DG system containing distance, chiral, and
+            fourth-dimension terms.
+        chiral_weight: Weight applied to chiral violation energy terms.
+        fourth_dim_weight: Weight applied to fourth-dimension penalty terms.
+        max_iters: Maximum number of L-BFGS iterations.
+        grad_tol: Gradient convergence tolerance.
+        lbfgs_m: L-BFGS history depth (number of stored vector pairs).
+
+    Returns:
+        Dictionary of kernel input arrays and scalar sizes.
+    """
     dim = system.dim
     n_mols = system.n_mols
     atom_starts_np = np.array(system.atom_starts.tolist(), dtype=np.int32)
@@ -718,29 +737,33 @@ def _pack_kernel_inputs(system, chiral_weight, fourth_dim_weight, max_iters,
 
 
 def metal_dg_lbfgs(
-    pos,
-    system,
-    chiral_weight=1.0,
-    fourth_dim_weight=0.1,
-    max_iters=400,
-    grad_tol=None,
-    tpm=DEFAULT_TPM,
-    lbfgs_m=DEFAULT_LBFGS_M,
-):
-    """Run DG L-BFGS minimization via Metal kernel with threadgroup parallelism.
+    pos: mx.array,
+    system: BatchedDGSystem,
+    chiral_weight: float = 1.0,
+    fourth_dim_weight: float = 0.1,
+    max_iters: int = 400,
+    grad_tol: float | None = None,
+    tpm: int = DEFAULT_TPM,
+    lbfgs_m: int = DEFAULT_LBFGS_M,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Run DG L-BFGS minimization on-device with threadgroup parallelism.
 
     Args:
-        pos: Initial flat positions, shape (n_atoms_total * dim,), float32.
-        system: BatchedDGSystem with all terms.
-        chiral_weight: Weight for chiral violation terms.
-        fourth_dim_weight: Weight for fourth dimension penalty.
-        max_iters: Maximum L-BFGS iterations.
-        grad_tol: Gradient convergence tolerance.
-        tpm: Threads per molecule (must be power of 2, e.g. 1, 8, 32).
-        lbfgs_m: L-BFGS history depth (number of vector pairs to store).
+        pos: Initial flat positions, shape ``(n_atoms_total * dim,)``, float32.
+        system: Batched DG system with all energy terms pre-packed.
+        chiral_weight: Weight for chiral violation energy terms.
+        fourth_dim_weight: Weight for fourth-dimension penalty terms.
+        max_iters: Maximum number of L-BFGS iterations per molecule.
+        grad_tol: Gradient convergence tolerance. Defaults to
+            ``DEFAULT_GRAD_TOL``.
+        tpm: Threads per molecule (must be a power of 2, e.g. 1, 8, 32).
+        lbfgs_m: L-BFGS history depth (number of stored vector pairs).
 
     Returns:
-        (final_pos, final_energies, statuses)
+        Tuple of ``(final_pos, final_energies, statuses)`` where
+        *final_pos* has the same shape as *pos*, *final_energies* is
+        shape ``(n_mols,)`` float32, and *statuses* is shape ``(n_mols,)``
+        int32 (0 = converged, 1 = active/not converged).
     """
     if grad_tol is None:
         grad_tol = DEFAULT_GRAD_TOL

@@ -12,23 +12,37 @@ Energy terms:
   - Angle constraint (triple bond linearity)
 """
 
+from __future__ import annotations
+
 import math
 
 import mlx.core as mx
+
+from ..preprocessing.etk_batching import BatchedETKSystem
 
 
 # ---------------------
 # Torsion Angle Energy
 # ---------------------
 
-def _calc_torsion_cos_phi(pos, idx1, idx2, idx3, idx4):
+def _calc_torsion_cos_phi(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    idx4: mx.array,
+) -> mx.array:
     """Compute cos(phi) for torsion angle defined by 4 atoms.
 
     Uses only xyz (first 3) coordinates regardless of pos dimension.
     Torsion angle is the dihedral angle between planes (1,2,3) and (2,3,4).
 
+    Args:
+        pos: Positions array, shape (n_atoms, dim), float32.
+        idx1, idx2, idx3, idx4: Atom indices, shape (n_terms,), int32.
+
     Returns:
-        cos_phi: (n_terms,) float32
+        Cosine of torsion angles, shape (n_terms,), float32.
     """
     # Work in 3D only — pos may be 4D but torsion uses xyz
     dim = pos.shape[1] if pos.ndim == 2 else 3
@@ -71,7 +85,11 @@ def _calc_torsion_cos_phi(pos, idx1, idx2, idx3, idx4):
     return cos_phi
 
 
-def _calc_torsion_energy_m6(fc, signs, cos_phi):
+def _calc_torsion_energy_m6(
+    fc: mx.array,
+    signs: mx.array,
+    cos_phi: mx.array,
+) -> mx.array:
     """Compute 6-term Fourier torsion energy.
 
     E = sum_k fc[k] * (1 + signs[k] * cos(k*phi))
@@ -79,12 +97,12 @@ def _calc_torsion_energy_m6(fc, signs, cos_phi):
     Uses Chebyshev recurrence for cos(n*phi) from cos(phi).
 
     Args:
-        fc: (n_terms, 6) force constants
-        signs: (n_terms, 6) sign factors
-        cos_phi: (n_terms,) cosine of torsion angle
+        fc: Force constants, shape (n_terms, 6), float32.
+        signs: Sign factors, shape (n_terms, 6), float32.
+        cos_phi: Cosine of torsion angle, shape (n_terms,), float32.
 
     Returns:
-        (n_terms,) energy values
+        Per-term energies, shape (n_terms,), float32.
     """
     c = cos_phi
     c2 = c * c
@@ -110,7 +128,16 @@ def _calc_torsion_energy_m6(fc, signs, cos_phi):
     return e
 
 
-def torsion_angle_energy(pos, idx1, idx2, idx3, idx4, fc, signs, dim):
+def torsion_angle_energy(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    idx4: mx.array,
+    fc: mx.array,
+    signs: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute experimental torsion angle energy for each term.
 
     Args:
@@ -129,10 +156,29 @@ def torsion_angle_energy(pos, idx1, idx2, idx3, idx4, fc, signs, dim):
     return _calc_torsion_energy_m6(fc, signs_f, cos_phi)
 
 
-def torsion_angle_grad(pos, idx1, idx2, idx3, idx4, fc, signs, dim):
+def torsion_angle_grad(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    idx4: mx.array,
+    fc: mx.array,
+    signs: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute experimental torsion angle gradient.
 
     Port of nvMolKit's torsionAngleGrad (dist_geom_kernels_device.cuh:451-575).
+
+    Args:
+        pos: Flat positions, shape (n_atoms * dim,), float32.
+        idx1, idx2, idx3, idx4: Atom indices, shape (n_terms,), int32.
+        fc: Force constants, shape (n_terms, 6), float32.
+        signs: Sign factors, shape (n_terms, 6), int32.
+        dim: Coordinate dimension.
+
+    Returns:
+        Gradient array, same shape as pos.
     """
     pos_r = pos.reshape(-1, dim)
     n_atoms = pos_r.shape[0]
@@ -256,13 +302,23 @@ def torsion_angle_grad(pos, idx1, idx2, idx3, idx4, fc, signs, dim):
 # Inversion Energy
 # ---------------------
 
-def _calc_inversion_cos_y(pos_r, idx1, idx2, idx3, idx4):
+def _calc_inversion_cos_y(
+    pos_r: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    idx4: mx.array,
+) -> mx.array:
     """Compute cosY for inversion (improper torsion).
 
     idx2 is the central atom. cosY measures out-of-plane angle.
 
+    Args:
+        pos_r: Reshaped positions, shape (n_atoms, dim), float32.
+        idx1, idx2, idx3, idx4: Atom indices, shape (n_terms,), int32.
+
     Returns:
-        cos_y: (n_terms,) float32
+        Cosine of out-of-plane angle, shape (n_terms,), float32.
     """
     p1 = pos_r[idx1][:, :3]
     p2 = pos_r[idx2][:, :3]
@@ -304,7 +360,18 @@ def _calc_inversion_cos_y(pos_r, idx1, idx2, idx3, idx4):
     return cos_y
 
 
-def inversion_energy(pos, idx1, idx2, idx3, idx4, C0, C1, C2, force_constant, dim):
+def inversion_energy(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    idx4: mx.array,
+    C0: mx.array,
+    C1: mx.array,
+    C2: mx.array,
+    force_constant: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute inversion (improper torsion) energy.
 
     E = forceConstant * (C0 + C1 * sinY + C2 * cos2W)
@@ -330,10 +397,31 @@ def inversion_energy(pos, idx1, idx2, idx3, idx4, C0, C1, C2, force_constant, di
     return force_constant * (C0 + C1 * sin_y + C2 * cos_2w)
 
 
-def inversion_grad(pos, idx1, idx2, idx3, idx4, C0, C1, C2, force_constant, dim):
+def inversion_grad(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    idx4: mx.array,
+    C0: mx.array,
+    C1: mx.array,
+    C2: mx.array,
+    force_constant: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute inversion (improper torsion) gradient.
 
     Port of nvMolKit's inversionGrad (dist_geom_kernels_device.cuh:577-704).
+
+    Args:
+        pos: Flat positions, shape (n_atoms * dim,), float32.
+        idx1, idx2, idx3, idx4: Atom indices, shape (n_terms,), int32. idx2 is central.
+        C0, C1, C2: Inversion coefficients, shape (n_terms,), float32.
+        force_constant: Force constants, shape (n_terms,), float32.
+        dim: Coordinate dimension.
+
+    Returns:
+        Gradient array, same shape as pos.
     """
     pos_r = pos.reshape(-1, dim)
     n_atoms = pos_r.shape[0]
@@ -441,7 +529,15 @@ def inversion_grad(pos, idx1, idx2, idx3, idx4, C0, C1, C2, force_constant, dim)
 # Distance Constraint
 # ---------------------
 
-def distance_constraint_energy(pos, idx1, idx2, min_len, max_len, force_constant, dim):
+def distance_constraint_energy(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    min_len: mx.array,
+    max_len: mx.array,
+    force_constant: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute flat-bottom distance constraint energy.
 
     E = 0.5 * fc * (d - bound)^2  if d < minLen or d > maxLen
@@ -476,10 +572,28 @@ def distance_constraint_energy(pos, idx1, idx2, min_len, max_len, force_constant
     return e_lo + e_hi
 
 
-def distance_constraint_grad(pos, idx1, idx2, min_len, max_len, force_constant, dim):
+def distance_constraint_grad(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    min_len: mx.array,
+    max_len: mx.array,
+    force_constant: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute distance constraint gradient.
 
     Port of nvMolKit's distanceConstraintGrad.
+
+    Args:
+        pos: Flat positions, shape (n_atoms * dim,), float32.
+        idx1, idx2: Atom indices, shape (n_terms,), int32.
+        min_len, max_len: Distance bounds, shape (n_terms,), float32.
+        force_constant: Shape (n_terms,), float32.
+        dim: Coordinate dimension.
+
+    Returns:
+        Gradient array, same shape as pos.
     """
     pos_r = pos.reshape(-1, dim)
     n_atoms = pos_r.shape[0]
@@ -514,8 +628,16 @@ def distance_constraint_grad(pos, idx1, idx2, min_len, max_len, force_constant, 
 RAD2DEG = 180.0 / math.pi
 
 
-def angle_constraint_energy(pos, idx1, idx2, idx3, min_angle, max_angle,
-                            force_constant, dim):
+def angle_constraint_energy(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    min_angle: mx.array,
+    max_angle: mx.array,
+    force_constant: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute angle constraint energy for triple bonds.
 
     E = fc * angleTerm^2  where angleTerm = angle - bound if outside [min, max]
@@ -558,11 +680,29 @@ def angle_constraint_energy(pos, idx1, idx2, idx3, min_angle, max_angle,
     return force_constant * angle_term * angle_term
 
 
-def angle_constraint_grad(pos, idx1, idx2, idx3, min_angle, max_angle,
-                          force_constant, dim):
+def angle_constraint_grad(
+    pos: mx.array,
+    idx1: mx.array,
+    idx2: mx.array,
+    idx3: mx.array,
+    min_angle: mx.array,
+    max_angle: mx.array,
+    force_constant: mx.array,
+    dim: int,
+) -> mx.array:
     """Compute angle constraint gradient.
 
     Port of nvMolKit's angleConstraintGrad.
+
+    Args:
+        pos: Flat positions, shape (n_atoms * dim,), float32.
+        idx1, idx2 (central), idx3: Atom indices, shape (n_terms,), int32.
+        min_angle, max_angle: Angle bounds in degrees, shape (n_terms,), float32.
+        force_constant: Shape (n_terms,) or scalar, float32.
+        dim: Coordinate dimension.
+
+    Returns:
+        Gradient array, same shape as pos.
     """
     pos_r = pos.reshape(-1, dim)
     n_atoms = pos_r.shape[0]
@@ -629,7 +769,11 @@ def angle_constraint_grad(pos, idx1, idx2, idx3, min_angle, max_angle,
 # Combined ETK Energy/Gradient
 # ---------------------
 
-def etk_energy(pos, system, use_basic_knowledge=True):
+def etk_energy(
+    pos: mx.array,
+    system: BatchedETKSystem,
+    use_basic_knowledge: bool = True,
+) -> mx.array:
     """Compute total ETK energy per molecule.
 
     Args:
@@ -696,7 +840,11 @@ def etk_energy(pos, system, use_basic_knowledge=True):
     return energies
 
 
-def etk_energy_and_grad(pos, system, use_basic_knowledge=True):
+def etk_energy_and_grad(
+    pos: mx.array,
+    system: BatchedETKSystem,
+    use_basic_knowledge: bool = True,
+) -> tuple[mx.array, mx.array]:
     """Compute total ETK energy and gradient.
 
     Args:
@@ -795,8 +943,17 @@ def etk_energy_and_grad(pos, system, use_basic_knowledge=True):
     return energies, grad
 
 
-def compute_planar_energy(pos, system, dim):
+def compute_planar_energy(
+    pos: mx.array,
+    system: BatchedETKSystem,
+    dim: int,
+) -> mx.array:
     """Compute total improper torsion energy per molecule (for planar check).
+
+    Args:
+        pos: Flat positions, shape (n_atoms_total * dim,), float32.
+        system: BatchedETKSystem with improper torsion terms.
+        dim: Coordinate dimension.
 
     Returns:
         Per-molecule energies, shape (n_mols,), float32.

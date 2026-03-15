@@ -7,12 +7,18 @@ for the ETK minimization stage.
 Port of nvMolKit's construct3DForceFieldContribs (dist_geom_flattened_builder.cpp).
 """
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
+
+if TYPE_CHECKING:
+    from rdkit.Chem.rdDistGeom import EmbedParameters
 
 # Constants matching nvMolKit's dist_geom_flattened_builder.cpp
 KNOWN_DIST_FORCE_CONSTANT = 100.0
@@ -78,13 +84,19 @@ class ETK3DParams:
     # Not stored — computed during extraction
 
 
-def _calc_inversion_coefficients(atomic_num, is_c_bound_to_o):
+def _calc_inversion_coefficients(
+    atomic_num: int, is_c_bound_to_o: bool
+) -> tuple[float, float, float, float]:
     """Compute inversion coefficients and force constant.
 
     Port of nvMolKit's calcInversionCoefficientsAndForceConstant.
 
+    Args:
+        atomic_num: Atomic number of the central atom.
+        is_c_bound_to_o: Whether a carbon center is bonded to oxygen.
+
     Returns:
-        (force_constant, C0, C1, C2)
+        Tuple of (force_constant, C0, C1, C2).
     """
     if atomic_num in (6, 7, 8):  # C, N, O — sp2
         C0 = 1.0
@@ -106,18 +118,29 @@ def _calc_inversion_coefficients(atomic_num, is_c_bound_to_o):
     return fc, C0, C1, C2
 
 
-def _extract_bonds(mol):
-    """Extract bonded atom pairs from molecular topology."""
+def _extract_bonds(mol: Chem.Mol) -> list[tuple[int, int]]:
+    """Extract bonded atom pairs from molecular topology.
+
+    Args:
+        mol: RDKit molecule.
+
+    Returns:
+        List of (begin_atom_idx, end_atom_idx) tuples.
+    """
     bonds = []
     for bond in mol.GetBonds():
         bonds.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
     return bonds
 
 
-def _extract_angles(mol):
+def _extract_angles(mol: Chem.Mol) -> list[tuple[int, int, int, bool]]:
     """Extract 1-3 atom triples from molecular topology.
 
-    Returns list of (idx1, central_idx, idx3, is_triple_bond).
+    Args:
+        mol: RDKit molecule.
+
+    Returns:
+        List of (idx1, central_idx, idx3, is_triple_bond) tuples.
     """
     angles = []
     for atom in mol.GetAtoms():
@@ -137,10 +160,17 @@ def _extract_angles(mol):
     return angles
 
 
-def _extract_improper_atoms(mol):
+def _extract_improper_atoms(
+    mol: Chem.Mol,
+) -> list[tuple[int, int, int, int, int, bool]]:
     """Extract improper torsion atoms (sp2 centers with 3 neighbors).
 
-    Returns list of (neighbor0, central, neighbor1, neighbor2, atomic_num, is_c_bound_to_o).
+    Args:
+        mol: RDKit molecule.
+
+    Returns:
+        List of (neighbor0, central, neighbor1, neighbor2, atomic_num,
+        is_c_bound_to_o) tuples.
     """
     impropers = []
     for atom in mol.GetAtoms():
@@ -167,16 +197,16 @@ def _extract_improper_atoms(mol):
 
 
 def extract_etk_params(
-    mol,
-    bounds_mat,
-    params=None,
-    use_exp_torsion=True,
-    use_basic_knowledge=True,
-    use_small_ring_torsions=False,
-    use_macrocycle_torsions=True,
-    et_version=2,
-    bounds_mat_force_scaling=1.0,
-):
+    mol: Chem.Mol,
+    bounds_mat: np.ndarray,
+    params: EmbedParameters | None = None,
+    use_exp_torsion: bool = True,
+    use_basic_knowledge: bool = True,
+    use_small_ring_torsions: bool = False,
+    use_macrocycle_torsions: bool = True,
+    et_version: int = 2,
+    bounds_mat_force_scaling: float = 1.0,
+) -> ETK3DParams:
     """Extract all ETK 3D force field parameters from an RDKit molecule.
 
     This mirrors nvMolKit's construct3DForceFieldContribs().
@@ -354,10 +384,26 @@ def extract_etk_params(
                 lr_max_list.append(ub)
                 lr_fc_list.append(fdist)
 
-    def _arr_i32(lst):
+    def _arr_i32(lst: list[int]) -> np.ndarray:
+        """Convert an int list to a numpy int32 array.
+
+        Args:
+            lst: List of integers.
+
+        Returns:
+            Numpy int32 array, or empty array if lst is empty.
+        """
         return np.array(lst, dtype=np.int32) if lst else np.array([], dtype=np.int32)
 
-    def _arr_f32(lst):
+    def _arr_f32(lst: list[float]) -> np.ndarray:
+        """Convert a float list to a numpy float32 array.
+
+        Args:
+            lst: List of floats.
+
+        Returns:
+            Numpy float32 array, or empty array if lst is empty.
+        """
         return np.array(lst, dtype=np.float32) if lst else np.array([], dtype=np.float32)
 
     torsion_fc = np.array(t_fc_list, dtype=np.float32).reshape(-1, 6) if t_fc_list else np.zeros((0, 6), dtype=np.float32)

@@ -26,13 +26,18 @@ PLANAR_TOLERANCE_FACTOR = 0.7
 _METAL_MAX_ATOMS = 64
 
 
-def _update_reference_positions(etk_system, positions, dim):
+def _update_reference_positions(
+    etk_system: BatchedETKSystem, positions: mx.array, dim: int
+) -> None:
     """Update dist12 and dist13 bounds from current 3D positions.
 
-    For non-improper-constrained terms, computes current distance and
-    centers the bounds around it (preserving the half-width).
+    Computes current distances for non-improper-constrained terms and
+    re-centers bounds around them (preserving the half-width).
 
-    Port of nvMolKit's updateReferencePositionsKernel.
+    Args:
+        etk_system: Batched ETK system whose bounds are updated in place.
+        positions: Flat positions array of shape ``(n_atoms_total * dim,)``.
+        dim: Coordinate dimension.
     """
     pos_r = positions.reshape(-1, dim)
 
@@ -84,8 +89,25 @@ def _update_reference_positions(etk_system, positions, dim):
         etk_system.long_range_max = dist + half_width
 
 
-def _try_metal_etk_lbfgs(ctx, etk_system, use_basic_knowledge, max_iters, grad_tol):
-    """Try Metal ETK L-BFGS kernel (threadgroup-parallel). Returns result or None."""
+def _try_metal_etk_lbfgs(
+    ctx: "PipelineContext",
+    etk_system: BatchedETKSystem,
+    use_basic_knowledge: bool,
+    max_iters: int,
+    grad_tol: float | None,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """Try Metal ETK L-BFGS kernel (threadgroup-parallel).
+
+    Args:
+        ctx: Pipeline context with positions and atom layout.
+        etk_system: Batched ETK force field system.
+        use_basic_knowledge: Include improper torsion terms.
+        max_iters: Maximum L-BFGS iterations.
+        grad_tol: Gradient tolerance, or None for default.
+
+    Returns:
+        Tuple of (positions, energies, statuses) arrays, or None on failure.
+    """
     try:
         from ..metal_kernels.etk_lbfgs import metal_etk_lbfgs
 
@@ -107,8 +129,25 @@ def _try_metal_etk_lbfgs(ctx, etk_system, use_basic_knowledge, max_iters, grad_t
         return None
 
 
-def _try_metal_etk_bfgs(ctx, etk_system, use_basic_knowledge, max_iters, grad_tol):
-    """Try Metal ETK BFGS kernel. Returns result or None on failure."""
+def _try_metal_etk_bfgs(
+    ctx: "PipelineContext",
+    etk_system: BatchedETKSystem,
+    use_basic_knowledge: bool,
+    max_iters: int,
+    grad_tol: float | None,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """Try Metal ETK BFGS kernel.
+
+    Args:
+        ctx: Pipeline context with positions and atom layout.
+        etk_system: Batched ETK force field system.
+        use_basic_knowledge: Include improper torsion terms.
+        max_iters: Maximum BFGS iterations.
+        grad_tol: Gradient tolerance, or None for default.
+
+    Returns:
+        Tuple of (positions, energies, statuses) arrays, or None on failure.
+    """
     try:
         from ..metal_kernels.etk_bfgs import metal_etk_bfgs
 
@@ -130,8 +169,25 @@ def _try_metal_etk_bfgs(ctx, etk_system, use_basic_knowledge, max_iters, grad_to
         return None
 
 
-def _try_vectorized_etk_bfgs(ctx, etk_system, use_basic_knowledge, max_iters, grad_tol):
-    """Try vectorized BFGS with ETK energy. Returns result or None on failure."""
+def _try_vectorized_etk_bfgs(
+    ctx: "PipelineContext",
+    etk_system: BatchedETKSystem,
+    use_basic_knowledge: bool,
+    max_iters: int,
+    grad_tol: float | None,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """Try vectorized BFGS with ETK energy.
+
+    Args:
+        ctx: Pipeline context with positions and atom layout.
+        etk_system: Batched ETK force field system.
+        use_basic_knowledge: Include improper torsion terms.
+        max_iters: Maximum BFGS iterations.
+        grad_tol: Gradient tolerance, or None for default.
+
+    Returns:
+        Tuple of (positions, energies, statuses) arrays, or None on failure.
+    """
     try:
         from ..minimizer.bfgs_vectorized import bfgs_minimize_vectorized
 
@@ -157,8 +213,14 @@ def _try_vectorized_etk_bfgs(ctx, etk_system, use_basic_knowledge, max_iters, gr
         return None
 
 
-def stage_etk_minimize(ctx, etk_system, use_basic_knowledge=True,
-                       max_iters=300, force_tol=None, minimizer="metal"):
+def stage_etk_minimize(
+    ctx: "PipelineContext",
+    etk_system: BatchedETKSystem,
+    use_basic_knowledge: bool = True,
+    max_iters: int = 300,
+    force_tol: float | None = None,
+    minimizer: str = "metal",
+) -> None:
     """Run BFGS minimization with ETK force field.
 
     Args:
@@ -168,9 +230,12 @@ def stage_etk_minimize(ctx, etk_system, use_basic_knowledge=True,
         max_iters: Maximum BFGS iterations.
         force_tol: Force tolerance for BFGS (None = default).
         minimizer: Which minimizer to use.
-            'metal' (default) — Metal kernel, fastest.
-            'vectorized' — vectorized Python BFGS.
-            'original' — original per-molecule BFGS (slowest, for debugging).
+            'metal' (default) -- Metal kernel, fastest.
+            'vectorized' -- vectorized Python BFGS.
+            'original' -- original per-molecule BFGS (slowest, for debugging).
+
+    Returns:
+        None. Mutates ``ctx.positions`` and ``ctx.failed`` in place.
     """
     # 1. Update reference positions from current 3D coords
     _update_reference_positions(etk_system, ctx.positions, ctx.dim)

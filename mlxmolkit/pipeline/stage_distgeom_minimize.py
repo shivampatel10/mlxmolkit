@@ -24,8 +24,25 @@ MAX_MINIMIZED_E_PER_ATOM = 0.05
 _METAL_MAX_ATOMS = 64
 
 
-def _try_metal_dg_lbfgs(ctx, system, chiral_weight, fourth_dim_weight, max_iters):
-    """Try Metal DG L-BFGS kernel (threadgroup-parallel). Returns result or None."""
+def _try_metal_dg_lbfgs(
+    ctx: PipelineContext,
+    system: "BatchedDGSystem",
+    chiral_weight: float,
+    fourth_dim_weight: float,
+    max_iters: int,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """Try Metal DG L-BFGS kernel (threadgroup-parallel).
+
+    Args:
+        ctx: Pipeline context with positions and atom layout.
+        system: Batched distance geometry system.
+        chiral_weight: Weight for chiral violation terms.
+        fourth_dim_weight: Weight for fourth dimension penalty.
+        max_iters: Maximum L-BFGS iterations.
+
+    Returns:
+        Tuple of (positions, energies, statuses) arrays, or None on failure.
+    """
     try:
         from ..metal_kernels.dg_lbfgs import metal_dg_lbfgs
 
@@ -47,8 +64,25 @@ def _try_metal_dg_lbfgs(ctx, system, chiral_weight, fourth_dim_weight, max_iters
         return None
 
 
-def _try_metal_dg_bfgs(ctx, system, chiral_weight, fourth_dim_weight, max_iters):
-    """Try Metal DG BFGS kernel. Returns result or None on failure."""
+def _try_metal_dg_bfgs(
+    ctx: PipelineContext,
+    system: "BatchedDGSystem",
+    chiral_weight: float,
+    fourth_dim_weight: float,
+    max_iters: int,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """Try Metal DG BFGS kernel.
+
+    Args:
+        ctx: Pipeline context with positions and atom layout.
+        system: Batched distance geometry system.
+        chiral_weight: Weight for chiral violation terms.
+        fourth_dim_weight: Weight for fourth dimension penalty.
+        max_iters: Maximum BFGS iterations.
+
+    Returns:
+        Tuple of (positions, energies, statuses) arrays, or None on failure.
+    """
     try:
         from ..metal_kernels.dg_bfgs import metal_dg_bfgs
 
@@ -71,8 +105,25 @@ def _try_metal_dg_bfgs(ctx, system, chiral_weight, fourth_dim_weight, max_iters)
         return None
 
 
-def _try_vectorized_bfgs(ctx, system, chiral_weight, fourth_dim_weight, max_iters):
-    """Try vectorized BFGS. Returns result or None on failure."""
+def _try_vectorized_bfgs(
+    ctx: PipelineContext,
+    system: "BatchedDGSystem",
+    chiral_weight: float,
+    fourth_dim_weight: float,
+    max_iters: int,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """Try vectorized BFGS minimization.
+
+    Args:
+        ctx: Pipeline context with positions and atom layout.
+        system: Batched distance geometry system.
+        chiral_weight: Weight for chiral violation terms.
+        fourth_dim_weight: Weight for fourth dimension penalty.
+        max_iters: Maximum BFGS iterations.
+
+    Returns:
+        Tuple of (positions, energies, statuses) arrays, or None on failure.
+    """
     try:
         from ..minimizer.bfgs_vectorized import bfgs_minimize_vectorized
 
@@ -101,7 +152,7 @@ def stage_distgeom_minimize(
     max_iters: int = 400,
     check_energy: bool = True,
     minimizer: str = "metal",
-):
+) -> None:
     """Run BFGS minimization with DG force field.
 
     Args:
@@ -111,9 +162,12 @@ def stage_distgeom_minimize(
         max_iters: Maximum BFGS iterations.
         check_energy: If True, fail molecules with energy per atom >= 0.05.
         minimizer: Which minimizer to use.
-            'metal' (default) — Metal L-BFGS -> dense BFGS -> vectorized -> original.
-            'vectorized' — vectorized Python BFGS (~58x speedup).
-            'original' — original per-molecule BFGS (slowest, for debugging).
+            'metal' (default) -- Metal L-BFGS -> dense BFGS -> vectorized -> original.
+            'vectorized' -- vectorized Python BFGS (~58x speedup).
+            'original' -- original per-molecule BFGS (slowest, for debugging).
+
+    Returns:
+        None. Mutates ``ctx.positions`` and ``ctx.failed`` in place.
     """
     system = ctx.dg_system
     result = None

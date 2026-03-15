@@ -27,13 +27,8 @@ def run_dg_pipeline(
     enforce_chirality: bool = True,
     seed: int | None = None,
     box_size_mult: float = 2.0,
-):
+) -> None:
     """Run ETKDG pipeline stages 1-4.
-
-    Stage 1: Random 4D coordinate generation
-    Stage 2: DG minimization (chiral_weight=1.0, fourth_dim_weight=0.1, 400 iters)
-    Stage 3: Tetrahedral check + first chiral center check
-    Stage 4: Fourth dimension minimization (chiral_weight=0.2, fourth_dim_weight=1.0, 200 iters)
 
     Args:
         ctx: Pipeline context (modified in place).
@@ -95,16 +90,8 @@ def run_full_pipeline(
     force_tol: float | None = None,
     seed: int | None = None,
     box_size_mult: float = 2.0,
-):
+) -> None:
     """Run full ETKDG pipeline stages 1-7.
-
-    Stage 1: Random 4D coordinate generation
-    Stage 2: DG minimization (4D BFGS)
-    Stage 3: Tetrahedral + first chiral check
-    Stage 4: Fourth dimension minimization
-    Stage 5: ETK minimization (3D BFGS with torsion knowledge)
-    Stage 6: Double bond geometry + final stereo checks
-    Stage 7: (implicit) conformer writeback handled by caller
 
     Args:
         ctx: Pipeline context (modified in place).
@@ -167,18 +154,24 @@ def run_full_pipeline(
         ctx.collect_failures()
 
 
-def _write_conformers(mol, positions, atom_start, n_atoms, dim):
+def _write_conformers(
+    mol: Chem.Mol,
+    positions: mx.array,
+    atom_start: int,
+    n_atoms: int,
+    dim: int,
+) -> int:
     """Write 3D coordinates back to RDKit molecule as a new conformer.
 
     Args:
-        mol: RDKit molecule to add conformer to.
+        mol: RDKit molecule to add the conformer to.
         positions: Flat MLX positions array.
         atom_start: Start index of this molecule's atoms.
         n_atoms: Number of atoms in this molecule.
         dim: Coordinate dimension.
 
     Returns:
-        Conformer ID of the added conformer, or -1 on failure.
+        Conformer ID of the added conformer.
     """
     mx.eval(positions)
     pos = np.array(positions).reshape(-1, dim)
@@ -196,20 +189,20 @@ def _write_conformers(mol, positions, atom_start, n_atoms, dim):
 
 def embed_molecules_pipeline(
     mols: list[Chem.Mol],
-    params,
+    params: rdDistGeom.EmbedParameters,
     confs_per_mol: int = 1,
     max_iterations: int = -1,
 ) -> None:
     """Full ETKDG embedding pipeline with retry loop.
 
     Generates conformers for each molecule using the ETKDG algorithm,
-    with retry attempts for failed conformers.
+    retrying failed conformers up to ``max_iterations`` times.
 
     Args:
         mols: RDKit molecules with hydrogens added.
-        params: RDKit EmbedParameters.
-        confs_per_mol: Number of conformers per molecule.
-        max_iterations: Max retry iterations (-1 = auto).
+        params: RDKit EmbedParameters controlling algorithm behavior.
+        confs_per_mol: Number of conformers to generate per molecule.
+        max_iterations: Max retry iterations (-1 = 10 * max_atoms).
     """
     if not mols:
         return

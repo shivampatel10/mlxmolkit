@@ -47,21 +47,18 @@ def _same_side(
     return (d1 > 0) == (d2 > 0)
 
 
-def stage_tetrahedral_check(ctx: PipelineContext, tol: float = 0.3):
+def stage_tetrahedral_check(ctx: PipelineContext, tol: float = 0.3) -> None:
     """Check tetrahedral geometry of sp3 centers.
 
     For each tetrahedral atom (center with 4 neighbors):
-    1. Volume test: Check 4 cross-dot products of normalized vectors
-       from center to neighbors. Fails if any volume is too small
-       (indicates planar/degenerate geometry).
-    2. Center-in-volume test: Check center is inside the tetrahedron
+    1. Volume test -- 4 cross-dot products of normalized vectors from center
+       to neighbors. Fails if any volume is too small (planar/degenerate).
+    2. Center-in-volume test -- checks center is inside the tetrahedron
        formed by its 4 neighbors using 4 same-side plane checks.
 
-    Port of nvMolKit's tetrahedralCheckKernel<doVolumeTest=true>.
-
     Args:
-        ctx: Pipeline context (modifies ctx.failed in place).
-        tol: Tolerance for same-side check (default 0.3).
+        ctx: Pipeline context (modifies ``ctx.failed`` in place).
+        tol: Tolerance for same-side check.
     """
     tet_data = ctx.tet_data
     if tet_data is None:
@@ -98,7 +95,8 @@ def stage_tetrahedral_check(ctx: PipelineContext, tol: float = 0.3):
         threshold = vol_scale * MIN_TETRAHEDRAL_CHIRAL_VOL
 
         # Normalized vectors from center to each neighbor
-        def _normalize(v):
+        def _normalize(v: np.ndarray) -> np.ndarray:
+            """Return unit vector, or original if near-zero length."""
             n = np.linalg.norm(v)
             return v / n if n > 1e-10 else v
 
@@ -137,19 +135,15 @@ def stage_tetrahedral_check(ctx: PipelineContext, tol: float = 0.3):
             continue
 
 
-def stage_first_chiral_check(ctx: PipelineContext):
+def stage_first_chiral_check(ctx: PipelineContext) -> None:
     """Check chiral volumes against bounds.
 
-    For each chiral center, compute the signed volume and check:
-    - If vol_lower > 0 and vol < vol_lower: fail if vol/vol_lower < 0.8
-      or opposite signs
-    - If vol_upper < 0 and vol > vol_upper: fail if vol/vol_upper < 0.8
-      or opposite signs
-
-    Port of nvMolKit's firstChiralCheckKernel.
+    For each chiral center, computes the signed volume and fails molecules
+    where the volume deviates from the allowed range by more than 20% or
+    has the wrong sign.
 
     Args:
-        ctx: Pipeline context (modifies ctx.failed in place).
+        ctx: Pipeline context (modifies ``ctx.failed`` in place).
     """
     system = ctx.dg_system
     n_chiral = system.chiral_idx1.shape[0]
@@ -205,17 +199,18 @@ def stage_first_chiral_check(ctx: PipelineContext):
 # ---------------------
 
 
-def stage_double_bond_geometry_check(ctx, double_bond_data):
+def stage_double_bond_geometry_check(
+    ctx: PipelineContext, double_bond_data: dict[str, np.ndarray] | None
+) -> None:
     """Check double bond geometry (linearity check).
 
     Fails molecules where two bonds around a double bond are nearly linear
     (dot product of normalized bond vectors ~ -1).
 
-    Port of nvMolKit's doubleBondGeometryKernel.
-
     Args:
-        ctx: Pipeline context (modifies ctx.failed in place).
-        double_bond_data: dict with 'idx0', 'idx1', 'idx2', 'mol_indices' arrays.
+        ctx: Pipeline context (modifies ``ctx.failed`` in place).
+        double_bond_data: Dict with 'idx0', 'idx1', 'idx2', 'mol_indices'
+            arrays, or None to skip.
     """
     if double_bond_data is None or len(double_bond_data['idx0']) == 0:
         return
@@ -253,17 +248,18 @@ def stage_double_bond_geometry_check(ctx, double_bond_data):
             ctx.failed[mol_idx] = True
 
 
-def stage_double_bond_stereo_check(ctx, stereo_bond_data):
+def stage_double_bond_stereo_check(
+    ctx: PipelineContext, stereo_bond_data: dict[str, np.ndarray] | None
+) -> None:
     """Check double bond stereo (E/Z) assignment.
 
     Computes dihedral-like angle between substituents and checks
     that the E/Z assignment matches the reference.
 
-    Port of nvMolKit's doubleBondStereoKernel.
-
     Args:
-        ctx: Pipeline context (modifies ctx.failed in place).
-        stereo_bond_data: dict with 'idx0'-'idx3', 'signs', 'mol_indices' arrays.
+        ctx: Pipeline context (modifies ``ctx.failed`` in place).
+        stereo_bond_data: Dict with 'idx0'-'idx3', 'signs', 'mol_indices'
+            arrays, or None to skip.
     """
     if stereo_bond_data is None or len(stereo_bond_data['idx0']) == 0:
         return
@@ -314,14 +310,15 @@ def stage_double_bond_stereo_check(ctx, stereo_bond_data):
             ctx.failed[mol_idx] = True
 
 
-def stage_chiral_dist_matrix_check(ctx, chiral_dist_data):
+def stage_chiral_dist_matrix_check(
+    ctx: PipelineContext, chiral_dist_data: dict[str, np.ndarray] | None
+) -> None:
     """Check distances between chiral center atoms against bounds matrix.
 
-    Port of nvMolKit's chiralDistMatrixCheck.
-
     Args:
-        ctx: Pipeline context (modifies ctx.failed in place).
-        chiral_dist_data: dict with 'idx0', 'idx1', 'lower', 'upper', 'mol_indices' arrays.
+        ctx: Pipeline context (modifies ``ctx.failed`` in place).
+        chiral_dist_data: Dict with 'idx0', 'idx1', 'lower', 'upper',
+            'mol_indices' arrays, or None to skip.
     """
     if chiral_dist_data is None or len(chiral_dist_data['idx0']) == 0:
         return
@@ -351,14 +348,15 @@ def stage_chiral_dist_matrix_check(ctx, chiral_dist_data):
             ctx.failed[mol_idx] = True
 
 
-def stage_chiral_volume_check(ctx):
+def stage_chiral_volume_check(ctx: PipelineContext) -> None:
     """Final chiral center volume check (center-in-volume only, no volume test).
 
-    Port of nvMolKit's ETKDGChiralCenterVolumeCheckStage (tetrahedralCheckKernel<false>).
-
-    This is the same as stage_tetrahedral_check but without the volume test.
+    Same as ``stage_tetrahedral_check`` but without the volume test.
     Only checks that the center atom is inside the tetrahedron formed by
     its 4 neighbors.
+
+    Args:
+        ctx: Pipeline context (modifies ``ctx.failed`` in place).
     """
     tet_data = ctx.tet_data
     if tet_data is None:

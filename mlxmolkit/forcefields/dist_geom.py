@@ -125,8 +125,17 @@ def dist_violation_grad_v2(
 ) -> mx.array:
     """Compute distance violation gradient using flat index scatter-add.
 
-    This version uses flat indexing for scatter-add, matching the nvMolKit
-    pattern more directly.
+    Uses flat indexing for scatter-add, matching the nvMolKit pattern.
+
+    Args:
+        pos: Flat positions array, shape (n_atoms * dim,), float32.
+        idx1, idx2: Atom index arrays, shape (n_terms,), int32.
+        lb2, ub2: Squared lower/upper bounds, shape (n_terms,), float32.
+        weight: Per-term weights, shape (n_terms,), float32.
+        dim: Coordinate dimension (3 or 4).
+
+    Returns:
+        Gradient array, same shape as pos.
     """
     pos_r = pos.reshape(-1, dim)
     n_atoms = pos_r.shape[0]
@@ -174,6 +183,11 @@ def _calc_chiral_volume(
     """Compute signed chiral volume and intermediate vectors.
 
     V = (p1-p4) . ((p2-p4) x (p3-p4))
+
+    Args:
+        pos: Flat positions array, shape (n_atoms * dim,), float32.
+        idx1, idx2, idx3, idx4: Atom indices, shape (n_terms,), int32.
+        dim: Coordinate dimension (3 or 4).
 
     Returns:
         (volume, v1, v2, v3) where v_i are difference vectors (n_terms, 3).
@@ -247,7 +261,15 @@ def chiral_violation_grad(
 ) -> mx.array:
     """Compute chiral violation gradient, accumulated into flat gradient array.
 
-    Matches nvMolKit's chiralViolationGrad exactly.
+    Args:
+        pos: Flat positions array, shape (n_atoms * dim,), float32.
+        idx1, idx2, idx3, idx4: Atom indices, shape (n_terms,), int32.
+        vol_lower, vol_upper: Volume bounds, shape (n_terms,), float32.
+        weight: Scalar chiral weight.
+        dim: Coordinate dimension (3 or 4).
+
+    Returns:
+        Gradient array, same shape as pos.
     """
     pos_r = pos.reshape(-1, dim)
     n_atoms = pos_r.shape[0]
@@ -356,6 +378,15 @@ def fourth_dim_grad(
 
     Note: nvMolKit's CUDA code uses weight * w (without the factor of 2),
     but we use the mathematically correct derivative here.
+
+    Args:
+        pos: Flat positions array, shape (n_atoms * dim,), float32.
+        idx: Atom indices, shape (n_terms,), int32.
+        weight: Fourth dimension weight scalar.
+        dim: Coordinate dimension (must be 4).
+
+    Returns:
+        Gradient array, same shape as pos.
     """
     if dim != 4:
         return mx.zeros_like(pos)

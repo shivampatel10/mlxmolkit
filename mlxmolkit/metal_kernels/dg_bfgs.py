@@ -498,8 +498,26 @@ _MSL_SOURCE = """
 """
 
 
-def _pack_kernel_inputs(system, chiral_weight, fourth_dim_weight, max_iters, grad_tol):
-    """Pack BatchedDGSystem fields into kernel input arrays."""
+def _pack_kernel_inputs(
+    system: BatchedDGSystem,
+    chiral_weight: float,
+    fourth_dim_weight: float,
+    max_iters: int,
+    grad_tol: float,
+) -> dict[str, mx.array | int]:
+    """Pack BatchedDGSystem fields into flat arrays for the Metal kernel.
+
+    Args:
+        system: Batched DG system containing distance, chiral, and
+            fourth-dimension terms.
+        chiral_weight: Weight applied to chiral violation energy terms.
+        fourth_dim_weight: Weight applied to fourth-dimension penalty terms.
+        max_iters: Maximum number of BFGS iterations.
+        grad_tol: Gradient convergence tolerance.
+
+    Returns:
+        Dictionary of kernel input arrays and scalar sizes.
+    """
     dim = system.dim
     n_mols = system.n_mols
     atom_starts_np = np.array(system.atom_starts.tolist(), dtype=np.int32)
@@ -579,25 +597,29 @@ def _pack_kernel_inputs(system, chiral_weight, fourth_dim_weight, max_iters, gra
 
 
 def metal_dg_bfgs(
-    pos,
-    system,
-    chiral_weight=1.0,
-    fourth_dim_weight=0.1,
-    max_iters=400,
-    grad_tol=None,
-):
-    """Run DG BFGS minimization via Metal kernel.
+    pos: mx.array,
+    system: BatchedDGSystem,
+    chiral_weight: float = 1.0,
+    fourth_dim_weight: float = 0.1,
+    max_iters: int = 400,
+    grad_tol: float | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Run DG BFGS minimization entirely on-device via a Metal kernel.
 
     Args:
-        pos: Initial flat positions, shape (n_atoms_total * dim,), float32.
-        system: BatchedDGSystem with all terms.
-        chiral_weight: Weight for chiral violation terms.
-        fourth_dim_weight: Weight for fourth dimension penalty.
-        max_iters: Maximum BFGS iterations.
-        grad_tol: Gradient convergence tolerance.
+        pos: Initial flat positions, shape ``(n_atoms_total * dim,)``, float32.
+        system: Batched DG system with all energy terms pre-packed.
+        chiral_weight: Weight for chiral violation energy terms.
+        fourth_dim_weight: Weight for fourth-dimension penalty terms.
+        max_iters: Maximum number of BFGS iterations per molecule.
+        grad_tol: Gradient convergence tolerance. Defaults to
+            ``DEFAULT_GRAD_TOL``.
 
     Returns:
-        (final_pos, final_energies, statuses)
+        Tuple of ``(final_pos, final_energies, statuses)`` where
+        *final_pos* has the same shape as *pos*, *final_energies* is
+        shape ``(n_mols,)`` float32, and *statuses* is shape ``(n_mols,)``
+        int32 (0 = converged, 1 = active/not converged).
     """
     if grad_tol is None:
         grad_tol = DEFAULT_GRAD_TOL
@@ -671,20 +693,31 @@ def metal_dg_bfgs(
 
 
 def metal_dg_bfgs_binned(
-    pos,
-    system,
-    chiral_weight=1.0,
-    fourth_dim_weight=0.1,
-    max_iters=400,
-    grad_tol=None,
-):
-    """Run DG BFGS with size binning for efficiency.
+    pos: mx.array,
+    system: BatchedDGSystem,
+    chiral_weight: float = 1.0,
+    fourth_dim_weight: float = 0.1,
+    max_iters: int = 400,
+    grad_tol: float | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Run DG BFGS with size-based binning for efficiency.
 
-    Groups molecules by atom count, dispatches separate kernel calls per bin.
-    Falls back to vectorized BFGS for molecules > MAX_ATOMS_METAL.
+    Groups molecules by atom count and dispatches separate kernel calls
+    per bin. Falls back to vectorized BFGS for molecules exceeding
+    ``MAX_ATOMS_METAL``.
+
+    Args:
+        pos: Initial flat positions, shape ``(n_atoms_total * dim,)``, float32.
+        system: Batched DG system with all energy terms pre-packed.
+        chiral_weight: Weight for chiral violation energy terms.
+        fourth_dim_weight: Weight for fourth-dimension penalty terms.
+        max_iters: Maximum number of BFGS iterations per molecule.
+        grad_tol: Gradient convergence tolerance. Defaults to
+            ``DEFAULT_GRAD_TOL``.
 
     Returns:
-        (final_pos, final_energies, statuses)
+        Tuple of ``(final_pos, final_energies, statuses)`` with the same
+        semantics as :func:`metal_dg_bfgs`.
     """
     if grad_tol is None:
         grad_tol = DEFAULT_GRAD_TOL

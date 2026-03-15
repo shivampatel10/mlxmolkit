@@ -3,7 +3,10 @@
 Assembles per-molecule ETK3DParams into batched arrays with global indices.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Callable
 
 import mlx.core as mx
 import numpy as np
@@ -97,8 +100,21 @@ def batch_etk_params(
     """
     n_mols = len(params_list)
 
-    def _batch_arrays(get_fn, idx_names, val_names):
-        """Generic batching helper."""
+    def _batch_arrays(
+        get_fn: Callable[[ETK3DParams, str], np.ndarray],
+        idx_names: list[str],
+        val_names: list[str],
+    ) -> tuple[dict[str, list[np.ndarray]], dict[str, list[np.ndarray]], list[np.ndarray]]:
+        """Batch index and value arrays across molecules with global offsets.
+
+        Args:
+            get_fn: Accessor that retrieves a named array from an ETK3DParams.
+            idx_names: Names of integer index arrays to offset by atom_starts.
+            val_names: Names of value arrays to concatenate without offset.
+
+        Returns:
+            Tuple of (idx_parts, val_parts, mol_parts) dictionaries and list.
+        """
         idx_parts = {name: [] for name in idx_names}
         val_parts = {name: [] for name in val_names}
         mol_parts = []
@@ -121,20 +137,54 @@ def batch_etk_params(
 
         return idx_parts, val_parts, mol_parts
 
-    def _get_attr(p, name):
+    def _get_attr(p: ETK3DParams, name: str) -> np.ndarray:
+        """Return a named attribute from an ETK3DParams instance.
+
+        Args:
+            p: Per-molecule ETK parameters.
+            name: Attribute name to retrieve.
+
+        Returns:
+            The attribute value as a numpy array.
+        """
         return getattr(p, name)
 
-    def _concat(parts):
+    def _concat(parts: list[np.ndarray]) -> mx.array:
+        """Concatenate float arrays into a single MLX array.
+
+        Args:
+            parts: List of numpy arrays to concatenate.
+
+        Returns:
+            Concatenated MLX float32 array, or empty array if parts is empty.
+        """
         if parts:
             return mx.array(np.concatenate(parts))
         return mx.array(np.array([], dtype=np.float32))
 
-    def _concat_i32(parts):
+    def _concat_i32(parts: list[np.ndarray]) -> mx.array:
+        """Concatenate arrays into a single MLX int32 array.
+
+        Args:
+            parts: List of numpy arrays to concatenate.
+
+        Returns:
+            Concatenated MLX int32 array, or empty array if parts is empty.
+        """
         if parts:
             return mx.array(np.concatenate(parts).astype(np.int32))
         return mx.array(np.array([], dtype=np.int32))
 
-    def _concat_2d(parts, cols):
+    def _concat_2d(parts: list[np.ndarray], cols: int) -> mx.array:
+        """Concatenate arrays and reshape into a 2D MLX float32 array.
+
+        Args:
+            parts: List of numpy arrays to concatenate.
+            cols: Number of columns in the output array.
+
+        Returns:
+            Concatenated MLX float32 array with shape (n, cols).
+        """
         if parts:
             return mx.array(np.concatenate(parts).reshape(-1, cols))
         return mx.array(np.zeros((0, cols), dtype=np.float32))

@@ -77,5 +77,12 @@ def clamp(x: mx.array, min_val: float, max_val: float) -> mx.array:
 
 
 def clip_to_one(x: mx.array) -> mx.array:
-    """Clip values to [-1, 1]."""
+    """Clip values to [-1, 1].
+
+    Args:
+        x: Input array.
+
+    Returns:
+        Array with values clamped to [-1, 1].
+    """
     return clamp(x, -1.0, 1.0)

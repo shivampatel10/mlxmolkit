@@ -4,6 +4,8 @@ Assembles per-molecule DG parameters into batched arrays with CSR indexing,
 suitable for efficient GPU processing on MLX.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -133,7 +135,16 @@ def batch_dg_params(params_list: list[DGParams], dim: int = 4) -> BatchedDGSyste
             fourth_idx_parts.append(p.fourth_dim_terms.idx + offset)
             fourth_mol_indices_parts.append(np.full(n_terms, i, dtype=np.int32))
 
-    def _concat_or_empty(parts, dtype):
+    def _concat_or_empty(parts: list[np.ndarray], dtype: np.dtype) -> mx.array:
+        """Concatenate numpy arrays into an MLX array, or return an empty array.
+
+        Args:
+            parts: List of numpy arrays to concatenate.
+            dtype: Numpy dtype to cast the result to.
+
+        Returns:
+            Concatenated MLX array, or empty MLX array if parts is empty.
+        """
         if parts:
             return mx.array(np.concatenate(parts).astype(dtype))
         return mx.array(np.array([], dtype=dtype))
