@@ -1,0 +1,366 @@
+"""Pipeline context for ETKDG stages.
+
+Provides the PipelineContext dataclass that holds all mutable state for a
+pipeline iteration, plus a factory function to create it from RDKit molecules.
+"""
+
+from dataclasses import dataclass, field
+
+import mlx.core as mx
+import numpy as np
+from rdkit import Chem
+
+from ..preprocessing.batching import BatchedDGSystem, batch_dg_params
+from ..preprocessing.etk_batching import BatchedETKSystem, batch_etk_params
+from ..preprocessing.rdkit_extract import (
+    TetrahedralCheckTerms,
+    extract_dg_params,
+    extract_tetrahedral_atoms,
+    get_bounds_matrix,
+)
+from ..preprocessing.torsion_prefs import extract_etk_params
+
+
+@dataclass
+class BatchedTetrahedralData:
+    """Batched tetrahedral check data for multiple molecules."""
+
+    idx0: mx.array  # int32 (n_terms,) — center atom (global index)
+    idx1: mx.array  # int32 (n_terms,)
+    idx2: mx.array  # int32 (n_terms,)
+    idx3: mx.array  # int32 (n_terms,)
+    idx4: mx.array  # int32 (n_terms,) — neighbor 4 (or idx0 for 3-coord)
+    in_fused_small_rings: mx.array  # bool (n_terms,)
+    mol_indices: mx.array  # int32 (n_terms,)
+
+
+@dataclass
+class PipelineContext:
+    """Mutable context for a pipeline iteration over a batch of molecules.
+
+    Modified in place by pipeline stages. After each stage, call
+    collect_failures() to deactivate failed molecules.
+    """
+
+    n_mols: int
+    dim: int
+    atom_starts: list[int]  # Python list, n_mols + 1
+    n_atoms_total: int
+
+    # Positions — updated by stages
+    positions: mx.array  # float32 (n_atoms_total * dim,)
+
+    # Per-molecule status
+    active: list[bool]
+    failed: list[bool]
+
+    # Force field data (batched)
+    dg_system: BatchedDGSystem
+
+    # Tetrahedral check data (batched)
+    tet_data: BatchedTetrahedralData | None
+
+    # ETK 3D force field data (batched) — created if use ETK stages
+    etk_system: BatchedETKSystem | None = None
+
+    # Double bond check data — created during context setup
+    double_bond_data: dict | None = None
+    stereo_bond_data: dict | None = None
+    chiral_dist_data: dict | None = None
+
+    # Bounds matrices (per-molecule, for chiral dist matrix check)
+    bounds_matrices: list | None = None
+
+    def collect_failures(self):
+        """Deactivate failed molecules. Call after each stage."""
+        for i in range(self.n_mols):
+            if self.failed[i]:
+                self.active[i] = False
+                self.failed[i] = False
+
+    def n_active(self) -> int:
+        """Return the number of active molecules."""
+        return sum(self.active)
+
+
+def _batch_tetrahedral_terms(
+    terms_list: list[TetrahedralCheckTerms],
+    atom_starts_np: np.ndarray,
+) -> BatchedTetrahedralData | None:
+    """Batch per-molecule tetrahedral check terms with atom offset."""
+    idx0_parts = []
+    idx1_parts = []
+    idx2_parts = []
+    idx3_parts = []
+    idx4_parts = []
+    fused_parts = []
+    mol_parts = []
+
+    for i, terms in enumerate(terms_list):
+        n = len(terms.idx0)
+        if n == 0:
+            continue
+        offset = int(atom_starts_np[i])
+        idx0_parts.append(terms.idx0 + offset)
+        idx1_parts.append(terms.idx1 + offset)
+        idx2_parts.append(terms.idx2 + offset)
+        idx3_parts.append(terms.idx3 + offset)
+        idx4_parts.append(terms.idx4 + offset)
+        fused_parts.append(terms.in_fused_small_rings)
+        mol_parts.append(np.full(n, i, dtype=np.int32))
+
+    if not idx0_parts:
+        return None
+
+    return BatchedTetrahedralData(
+        idx0=mx.array(np.concatenate(idx0_parts).astype(np.int32)),
+        idx1=mx.array(np.concatenate(idx1_parts).astype(np.int32)),
+        idx2=mx.array(np.concatenate(idx2_parts).astype(np.int32)),
+        idx3=mx.array(np.concatenate(idx3_parts).astype(np.int32)),
+        idx4=mx.array(np.concatenate(idx4_parts).astype(np.int32)),
+        in_fused_small_rings=mx.array(np.concatenate(fused_parts)),
+        mol_indices=mx.array(np.concatenate(mol_parts).astype(np.int32)),
+    )
+
+
+def _extract_double_bond_data(mols, atom_starts):
+    """Extract double bond geometry check data from molecules.
+
+    Returns dict with idx0, idx1, idx2, mol_indices arrays for the
+    double bond linearity check.
+    """
+    idx0_list, idx1_list, idx2_list, mol_list = [], [], [], []
+
+    for i, mol in enumerate(mols):
+        offset = atom_starts[i]
+        for bond in mol.GetBonds():
+            if bond.GetBondTypeAsDouble() == 2.0:
+                a1 = bond.GetBeginAtomIdx()
+                a2 = bond.GetEndAtomIdx()
+                # Check both ends for geometry
+                for center, other in [(a1, a2), (a2, a1)]:
+                    atom = mol.GetAtomWithIdx(center)
+                    for neighbor in atom.GetNeighbors():
+                        nidx = neighbor.GetIdx()
+                        if nidx != other:
+                            idx0_list.append(nidx + offset)
+                            idx1_list.append(center + offset)
+                            idx2_list.append(other + offset)
+                            mol_list.append(i)
+
+    if not idx0_list:
+        return None
+
+    return {
+        'idx0': np.array(idx0_list, dtype=np.int32),
+        'idx1': np.array(idx1_list, dtype=np.int32),
+        'idx2': np.array(idx2_list, dtype=np.int32),
+        'mol_indices': np.array(mol_list, dtype=np.int32),
+    }
+
+
+def _extract_stereo_bond_data(mols, atom_starts):
+    """Extract double bond stereo check data from molecules.
+
+    Returns dict with idx0-idx3, signs, mol_indices arrays.
+    """
+    idx0_list, idx1_list, idx2_list, idx3_list = [], [], [], []
+    signs_list, mol_list = [], []
+
+    for i, mol in enumerate(mols):
+        offset = atom_starts[i]
+        Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+
+        for bond in mol.GetBonds():
+            stereo = bond.GetStereo()
+            if stereo == Chem.BondStereo.STEREONONE:
+                continue
+            if bond.GetBondTypeAsDouble() != 2.0:
+                continue
+
+            stereo_atoms = list(bond.GetStereoAtoms())
+            if len(stereo_atoms) != 2:
+                continue
+
+            a1 = bond.GetBeginAtomIdx()
+            a2 = bond.GetEndAtomIdx()
+            s1 = stereo_atoms[0]
+            s2 = stereo_atoms[1]
+
+            # Sign: +1 for Z (same side), -1 for E (opposite side)
+            if stereo == Chem.BondStereo.STEREOZ:
+                sign = 1
+            elif stereo == Chem.BondStereo.STEREOE:
+                sign = -1
+            else:
+                continue
+
+            idx0_list.append(s1 + offset)
+            idx1_list.append(a1 + offset)
+            idx2_list.append(a2 + offset)
+            idx3_list.append(s2 + offset)
+            signs_list.append(sign)
+            mol_list.append(i)
+
+    if not idx0_list:
+        return None
+
+    return {
+        'idx0': np.array(idx0_list, dtype=np.int32),
+        'idx1': np.array(idx1_list, dtype=np.int32),
+        'idx2': np.array(idx2_list, dtype=np.int32),
+        'idx3': np.array(idx3_list, dtype=np.int32),
+        'signs': np.array(signs_list, dtype=np.int32),
+        'mol_indices': np.array(mol_list, dtype=np.int32),
+    }
+
+
+def _extract_chiral_dist_data(mols, bounds_matrices, atom_starts, dg_system):
+    """Extract chiral distance matrix check data.
+
+    For each chiral center, collects all pairwise distances between
+    atoms involved in chirality and checks against bounds matrix.
+    """
+    idx0_list, idx1_list = [], []
+    lower_list, upper_list = [], []
+    mol_list = []
+
+    chiral_idx1 = np.array(dg_system.chiral_idx1)
+    chiral_idx2 = np.array(dg_system.chiral_idx2)
+    chiral_idx3 = np.array(dg_system.chiral_idx3)
+    chiral_idx4 = np.array(dg_system.chiral_idx4)
+    chiral_mol = np.array(dg_system.chiral_mol_indices)
+
+    for i, mol in enumerate(mols):
+        offset = atom_starts[i]
+        bmat = bounds_matrices[i]
+
+        # Collect all chiral atom indices for this molecule
+        chiral_mask = chiral_mol == i
+        if not np.any(chiral_mask):
+            continue
+
+        chiral_atoms = set()
+        for t in np.where(chiral_mask)[0]:
+            # Convert global back to local
+            for idx_arr in [chiral_idx1, chiral_idx2, chiral_idx3, chiral_idx4]:
+                local = int(idx_arr[t]) - offset
+                if 0 <= local < mol.GetNumAtoms():
+                    chiral_atoms.add(local)
+
+        chiral_atoms = sorted(chiral_atoms)
+        for j in range(len(chiral_atoms)):
+            for k in range(j + 1, len(chiral_atoms)):
+                a0 = chiral_atoms[j]
+                a1 = chiral_atoms[k]
+                lb = bmat[max(a0, a1), min(a0, a1)]
+                ub = bmat[min(a0, a1), max(a0, a1)]
+
+                idx0_list.append(a0 + offset)
+                idx1_list.append(a1 + offset)
+                lower_list.append(lb)
+                upper_list.append(ub)
+                mol_list.append(i)
+
+    if not idx0_list:
+        return None
+
+    return {
+        'idx0': np.array(idx0_list, dtype=np.int32),
+        'idx1': np.array(idx1_list, dtype=np.int32),
+        'lower': np.array(lower_list, dtype=np.float64),
+        'upper': np.array(upper_list, dtype=np.float64),
+        'mol_indices': np.array(mol_list, dtype=np.int32),
+    }
+
+
+def create_pipeline_context(
+    mols: list[Chem.Mol],
+    dim: int = 4,
+    basin_size_tol: float = 1e8,
+    params=None,
+    use_etk: bool = False,
+    enforce_chirality: bool = True,
+) -> PipelineContext:
+    """Create a pipeline context from a list of RDKit molecules.
+
+    Handles all preprocessing: bounds matrix, DG params, tetrahedral atoms,
+    and optionally ETK 3D force field params.
+
+    Args:
+        mols: RDKit molecules with hydrogens added.
+        dim: Coordinate dimension (4 for ETKDG).
+        basin_size_tol: Basin size tolerance for distance terms.
+            Default 1e8 matches nvMolKit's randomCoordsBasinThresh.
+        params: Optional RDKit EmbedParameters for ETK extraction.
+        use_etk: Whether to extract ETK parameters.
+        enforce_chirality: Whether to set up chirality check data.
+
+    Returns:
+        PipelineContext ready for pipeline stages.
+    """
+    n_mols = len(mols)
+
+    # Extract per-molecule data
+    dg_params_list = []
+    tet_terms_list = []
+    etk_params_list = []
+    bounds_matrices = []
+
+    for mol in mols:
+        bounds_mat = get_bounds_matrix(mol)
+        bounds_matrices.append(bounds_mat)
+        dg_params = extract_dg_params(mol, bounds_mat, dim, basin_size_tol)
+        dg_params_list.append(dg_params)
+        tet_terms = extract_tetrahedral_atoms(mol)
+        tet_terms_list.append(tet_terms)
+
+        if use_etk:
+            etk = extract_etk_params(mol, bounds_mat, params=params)
+            etk_params_list.append(etk)
+
+    # Batch DG params
+    dg_system = batch_dg_params(dg_params_list, dim)
+
+    # Batch tetrahedral terms
+    atom_starts_np = np.array(dg_system.atom_starts.tolist(), dtype=np.int32)
+    tet_data = _batch_tetrahedral_terms(tet_terms_list, atom_starts_np)
+
+    atom_starts = dg_system.atom_starts.tolist()
+    n_atoms_total = dg_system.n_atoms_total
+
+    # Initialize positions to zeros (coordgen will fill them)
+    positions = mx.zeros(n_atoms_total * dim, dtype=mx.float32)
+
+    # Build ETK system if requested
+    etk_system = None
+    if use_etk and etk_params_list:
+        etk_system = batch_etk_params(etk_params_list, atom_starts, dim)
+
+    # Extract double bond and stereo data
+    double_bond_data = _extract_double_bond_data(mols, atom_starts)
+    stereo_bond_data = _extract_stereo_bond_data(mols, atom_starts)
+
+    # Chiral distance matrix check data
+    chiral_dist_data = None
+    if enforce_chirality:
+        chiral_dist_data = _extract_chiral_dist_data(
+            mols, bounds_matrices, atom_starts, dg_system
+        )
+
+    return PipelineContext(
+        n_mols=n_mols,
+        dim=dim,
+        atom_starts=atom_starts,
+        n_atoms_total=n_atoms_total,
+        positions=positions,
+        active=[True] * n_mols,
+        failed=[False] * n_mols,
+        dg_system=dg_system,
+        tet_data=tet_data,
+        etk_system=etk_system,
+        double_bond_data=double_bond_data,
+        stereo_bond_data=stereo_bond_data,
+        chiral_dist_data=chiral_dist_data,
+        bounds_matrices=bounds_matrices,
+    )

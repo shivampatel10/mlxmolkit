@@ -1,0 +1,30 @@
+[project]
+name = "mlxmolkit"
+version = "0.1.0"
+description = "GPU-accelerated molecular 3D coordinate generation on Apple Silicon using MLX"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+    { name = "Shivam Patel", email = "shivam.1108@gmail.com" },
+]
+dependencies = [
+    "mlx>=0.31.1",
+    "numpy>=2.4.3",
+    "rdkit>=2025.9.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/shivampatel10/mlxmolkit"
+Repository = "https://github.com/shivampatel10/mlxmolkit"
+Issues = "https://github.com/shivampatel10/mlxmolkit/issues"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
