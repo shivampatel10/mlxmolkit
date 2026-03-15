@@ -21,7 +21,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Build package
-        run: uv run python -m build
+        run: uvx --from build pyproject-build
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
