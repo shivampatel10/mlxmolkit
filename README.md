@@ -48,5 +48,6 @@ Supports all standard ETKDG variants: ETKDG, ETKDGv2, ETKDGv3, srETKDGv3, KDG, E
 
 ## Links
 
+- [Documentation](https://shivampatel10.github.io/mlxmolkit/)
 - [Repository](https://github.com/shivampatel10/mlxmolkit)
 - [Issues](https://github.com/shivampatel10/mlxmolkit/issues)

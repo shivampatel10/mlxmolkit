@@ -38,6 +38,7 @@ docs = [
 
 [project.urls]
 Homepage = "https://github.com/shivampatel10/mlxmolkit"
+Documentation = "https://shivampatel10.github.io/mlxmolkit/"
 Repository = "https://github.com/shivampatel10/mlxmolkit"
 Issues = "https://github.com/shivampatel10/mlxmolkit/issues"
 
