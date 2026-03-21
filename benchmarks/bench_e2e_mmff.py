@@ -70,62 +70,33 @@ def bench_rdkit_cpu(mols):
 # ---------------------------------------------------------------------------
 def bench_mlx_gpu(mols):
     from mlxmolkit.embed_molecules import EmbedMolecules
-    from mlxmolkit.metal_kernels.mmff_bfgs import metal_mmff_bfgs_tg
-    from mlxmolkit.preprocessing.mmff_batching import batch_mmff_params
-    from mlxmolkit.preprocessing.mmff_extract import extract_mmff_params
+    from mlxmolkit.mmff_optimize import MMFFOptimizeMoleculesConfs
 
     mlx_mols = [Chem.Mol(m) for m in mols]
 
     t0 = time.perf_counter()
 
-    # Phase 1: Conformer generation (GPU)
+    # Phase 1: Conformer generation (GPU, auto-chunked)
     embed_params = rdDistGeom.ETKDGv3()
     embed_params.useRandomCoords = True
     embed_params.randomSeed = 42
     EmbedMolecules(mlx_mols, embed_params, confsPerMolecule=CONFS_PER_MOL)
     t_embed = time.perf_counter() - t0
 
-    # Phase 2: MMFF param extraction + batching
+    # Phase 2+3: MMFF optimization (GPU, auto-chunked)
     t1 = time.perf_counter()
-    all_params, all_positions, conf_counts = [], [], []
-    for mol in mlx_mols:
-        n_confs = mol.GetNumConformers()
-        conf_counts.append(n_confs)
-        if n_confs == 0:
-            continue
-        params = extract_mmff_params(mol)
-        if params is None:
-            continue
-        n_atoms = mol.GetNumAtoms()
-        for conf_idx in range(n_confs):
-            conf = mol.GetConformer(conf_idx)
-            positions = np.empty(n_atoms * 3, dtype=np.float32)
-            for i in range(n_atoms):
-                pt = conf.GetAtomPosition(i)
-                positions[i * 3] = pt.x
-                positions[i * 3 + 1] = pt.y
-                positions[i * 3 + 2] = pt.z
-            all_params.append(params)
-            all_positions.append(positions)
-    t_extract = time.perf_counter() - t1
-
-    # Phase 3: MMFF optimization (TG Metal kernel)
-    t2 = time.perf_counter()
-    if all_params:
-        system = batch_mmff_params(all_params)
-        pos = mx.array(np.concatenate(all_positions), dtype=mx.float32)
-        final_pos, final_e, statuses = metal_mmff_bfgs_tg(pos, system, max_iters=200)
-        mx.eval(final_pos, final_e, statuses)
-    t_mmff = time.perf_counter() - t2
+    MMFFOptimizeMoleculesConfs(mlx_mols, maxIters=200)
+    t_mmff = time.perf_counter() - t1
 
     total_elapsed = time.perf_counter() - t0
-    total_confs = sum(conf_counts)
-    total_atoms = sum(c * mol.GetNumAtoms() for c, mol in zip(conf_counts, mlx_mols) if c > 0)
-    return total_elapsed, t_embed, t_extract, t_mmff, total_confs, total_atoms
+    total_confs = sum(mol.GetNumConformers() for mol in mlx_mols)
+    total_atoms = sum(mol.GetNumConformers() * mol.GetNumAtoms() for mol in mlx_mols
+                      if mol.GetNumConformers() > 0)
+    return total_elapsed, t_embed, 0.0, t_mmff, total_confs, total_atoms
 
 
 def main():
-    mols = load_molecules()
+    mols = load_molecules()[:100]
     n_mols = len(mols)
 
     print("=" * 78)

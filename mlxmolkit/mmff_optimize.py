@@ -56,16 +56,21 @@ def MMFFOptimizeMoleculesConfs(
     molecules: list[Mol],
     maxIters: int = 200,
     nonBondedThreshold: float = 100.0,
+    batchSize: int = 250,
 ) -> list[list[float]]:
     """Optimize conformers using MMFF94 force field with GPU-accelerated BFGS.
 
-    Validates molecules, extracts MMFF parameters, batches all conformers,
-    runs vectorized BFGS minimization, and updates conformer coordinates in-place.
+    Validates molecules, extracts MMFF parameters, batches conformers in
+    chunks, runs vectorized BFGS minimization, and updates conformer
+    coordinates in-place.
 
     Args:
         molecules: List of RDKit molecules with conformers already generated.
         maxIters: Maximum BFGS iterations per conformer.
         nonBondedThreshold: Distance cutoff for non-bonded interactions (Angstroms).
+        batchSize: Maximum molecules per GPU batch. Larger batches are
+            more efficient but may hit Metal GPU timeout limits. Default
+            250 (5,000 conformers at 20 confs/mol).
 
     Returns:
         List of lists of final energies, grouped by molecule.
@@ -74,16 +79,28 @@ def MMFFOptimizeMoleculesConfs(
     if not molecules:
         return []
 
-    # Step 1: Validate molecules and extract params
-    # Bonded terms (bond, angle, stretch-bend, OOP, torsion) depend only on
-    # topology — extract once per molecule and reuse for all conformers.
-    # Non-bonded terms also only depend on topology when nonBondedThreshold
-    # is large (default 100 Å covers all drug-like molecules).
+    result: list[list[float]] = [[] for _ in range(len(molecules))]
+
+    for chunk_start in range(0, len(molecules), batchSize):
+        chunk = molecules[chunk_start : chunk_start + batchSize]
+        _mmff_optimize_chunk(chunk, chunk_start, maxIters, nonBondedThreshold, result)
+
+    return result
+
+
+def _mmff_optimize_chunk(
+    chunk: list[Mol],
+    mol_offset: int,
+    max_iters: int,
+    non_bonded_threshold: float,
+    result: list[list[float]],
+) -> None:
+    """Optimize one chunk of molecules and accumulate results."""
     all_params: list[MMFFParams] = []
     all_positions: list[np.ndarray] = []
-    conf_map: list[tuple[int, int]] = []
+    conf_map: list[tuple[int, int]] = []  # (global_mol_idx, conf_idx)
 
-    for mol_idx, mol in enumerate(molecules):
+    for local_idx, mol in enumerate(chunk):
         if mol is None:
             continue
         props = rdForceFieldHelpers.MMFFGetMoleculeProperties(mol)
@@ -93,15 +110,14 @@ def MMFFOptimizeMoleculesConfs(
         if n_confs == 0:
             continue
 
-        # Extract params once per molecule (use first conformer for any
-        # distance-based filtering, which is effectively a no-op at 100 Å)
         params = extract_mmff_params(
-            mol, conf_id=-1, nonBondedThreshold=nonBondedThreshold
+            mol, conf_id=-1, nonBondedThreshold=non_bonded_threshold
         )
         if params is None:
             continue
 
         n_atoms = mol.GetNumAtoms()
+        global_idx = mol_offset + local_idx
         for conf_idx in range(n_confs):
             conf = mol.GetConformer(conf_idx)
             positions = np.empty(n_atoms * 3, dtype=np.float32)
@@ -112,29 +128,22 @@ def MMFFOptimizeMoleculesConfs(
                 positions[i * 3 + 2] = pt.z
             all_params.append(params)
             all_positions.append(positions)
-            conf_map.append((mol_idx, conf_idx))
+            conf_map.append((global_idx, conf_idx))
 
     if not all_params:
-        return [[] for _ in molecules]
+        return
 
-    # Step 2: Batch all conformers as independent "molecules"
     system = batch_mmff_params(all_params)
-
-    # Step 3: Assemble initial positions
     pos = mx.array(np.concatenate(all_positions), dtype=mx.float32)
-
-    # Step 4: Build atom_starts list for BFGS
     atom_starts_list = [int(system.atom_starts[i]) for i in range(system.n_mols + 1)]
 
-    # Step 5: Run BFGS minimization — prefer Metal kernel, fall back to pure MLX
-    final_pos, final_energies = _run_bfgs(pos, system, atom_starts_list, maxIters)
+    final_pos, final_energies = _run_bfgs(pos, system, atom_starts_list, max_iters)
 
-    # Step 6: Write optimized positions back to RDKit conformers
     final_pos_np = np.array(final_pos, dtype=np.float64)
     final_energies_np = np.array(final_energies, dtype=np.float64)
 
-    for batch_idx, (mol_idx, conf_idx) in enumerate(conf_map):
-        mol = molecules[mol_idx]
+    for batch_idx, (global_mol_idx, conf_idx) in enumerate(conf_map):
+        mol = chunk[global_mol_idx - mol_offset]
         conf = mol.GetConformer(conf_idx)
         start = atom_starts_list[batch_idx]
         n_atoms = mol.GetNumAtoms()
@@ -146,12 +155,4 @@ def MMFFOptimizeMoleculesConfs(
                  float(coords[atom_idx, 1]),
                  float(coords[atom_idx, 2])),
             )
-
-    # Step 7: Group energies by original molecule
-    _ = None  # unused statuses
-    n_molecules = len(molecules)
-    result: list[list[float]] = [[] for _ in range(n_molecules)]
-    for batch_idx, (mol_idx, _) in enumerate(conf_map):
-        result[mol_idx].append(float(final_energies_np[batch_idx]))
-
-    return result
+        result[global_mol_idx].append(float(final_energies_np[batch_idx]))
