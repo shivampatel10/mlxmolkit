@@ -8,7 +8,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
-from .context import PipelineContext, create_pipeline_context
+from .context import PipelineContext, create_pipeline_context, create_pipeline_context_multi_conf
 from .stage_coordgen import stage_coordgen
 from .stage_distgeom_minimize import stage_distgeom_minimize
 from .stage_etk_minimize import stage_etk_minimize
@@ -56,14 +56,7 @@ def run_dg_pipeline(
     if ctx.n_active() == 0:
         return
 
-    # Stage 3a: Tetrahedral check
-    stage_tetrahedral_check(ctx, tol=0.3)
-    ctx.collect_failures()
-
-    if ctx.n_active() == 0:
-        return
-
-    # Stage 3b: First chiral check
+    # Stage 3: First chiral check
     if enforce_chirality:
         stage_first_chiral_check(ctx)
         ctx.collect_failures()
@@ -71,7 +64,7 @@ def run_dg_pipeline(
         if ctx.n_active() == 0:
             return
 
-    # Stage 4: Fourth dimension minimization
+    # Stage 4: Fourth dimension minimization (collapses 4th dim)
     stage_distgeom_minimize(
         ctx,
         chiral_weight=0.2,
@@ -79,6 +72,16 @@ def run_dg_pipeline(
         max_iters=200,
         check_energy=False,
     )
+    ctx.collect_failures()
+
+    if ctx.n_active() == 0:
+        return
+
+    # Stage 4b: Tetrahedral check — must run AFTER 4th dim collapse so
+    # the 3D projection has proper tetrahedral geometry. Running this
+    # before collapse causes false positives because the 4th dimension
+    # component makes atoms appear coplanar in the 3D projection.
+    stage_tetrahedral_check(ctx, tol=0.3)
     ctx.collect_failures()
 
 
@@ -193,10 +196,17 @@ def embed_molecules_pipeline(
     confs_per_mol: int = 1,
     max_iterations: int = -1,
 ) -> None:
-    """Full ETKDG embedding pipeline with retry loop.
+    """Full ETKDG embedding pipeline with batched multi-conformer generation.
 
-    Generates conformers for each molecule using the ETKDG algorithm,
-    retrying failed conformers up to ``max_iterations`` times.
+    Generates conformers using a bulk batch approach: all molecules are
+    replicated for the requested number of conformers and processed in a
+    single GPU pipeline pass. Failed conformers are retried in batched
+    rounds with overshoot (3x what's needed) until all molecules have
+    enough conformers or max retries are exhausted.
+
+    A persistent RNG advances across all pipeline passes (matching
+    nvMolKit's global RNG), ensuring each conformer attempt sees
+    fundamentally different random coordinates.
 
     Args:
         mols: RDKit molecules with hydrogens added.
@@ -214,7 +224,7 @@ def embed_molecules_pipeline(
     if max_iterations <= 0:
         max_iterations = 10 * max_atoms
 
-    # Determine pipeline flags
+    # Pipeline flags
     use_exp_torsion = params.useExpTorsionAnglePrefs
     use_basic_knowledge = params.useBasicKnowledge
     use_etk = use_exp_torsion or use_basic_knowledge
@@ -222,59 +232,102 @@ def embed_molecules_pipeline(
     force_tol = getattr(params, 'optimizerForceTol', None)
     box_size_mult = getattr(params, 'boxSizeMult', 2.0)
 
-    # Seed handling
+    # Create persistent RNG (matches nvMolKit's global advancing RNG)
     base_seed = params.randomSeed if params.randomSeed >= 0 else None
+    rng = np.random.default_rng(base_seed)
 
-    # Track conformers generated per molecule
+    # Track conformers generated and attempts per molecule
     confs_generated = [0] * n_mols
+    total_attempts = [0] * n_mols
+    # Molecules with 0% success after a full round are marked as given up
+    given_up = [False] * n_mols
 
-    # Retry loop
-    for iteration in range(max_iterations):
-        # Check which molecules still need conformers
-        need_more = [i for i in range(n_mols) if confs_generated[i] < confs_per_mol]
+    # Retry strategy: bulk first pass + up to 3 retry rounds with overshoot.
+    # Only retry molecules that showed >0% success rate in prior rounds.
+    max_retries = 3
+    overshoot_factor = 3
+
+    for retry_round in range(max_retries + 1):
+        # Determine which molecules still need conformers
+        need_more = [
+            i for i in range(n_mols)
+            if confs_generated[i] < confs_per_mol and not given_up[i]
+        ]
         if not need_more:
             break
 
-        # Create context for molecules needing conformers
+        # Compute how many conformer slots to request per molecule
+        if retry_round == 0:
+            # First pass: request exactly what's needed
+            slots_per_mol = [confs_per_mol] * len(need_more)
+        else:
+            # Retries: overshoot to fill remaining, capped at 3× needed
+            slots_per_mol = [
+                (confs_per_mol - confs_generated[i]) * overshoot_factor
+                for i in need_more
+            ]
+
         batch_mols = [mols[i] for i in need_more]
 
-        ctx = create_pipeline_context(
+        # Track attempts
+        for idx, i in enumerate(need_more):
+            total_attempts[i] += slots_per_mol[idx]
+
+        # Create multi-conf context (params extracted once, replicated)
+        ctx = create_pipeline_context_multi_conf(
             batch_mols,
+            confs_per_mol=slots_per_mol,
             dim=4,
             basin_size_tol=1e8,
             params=params if use_etk else None,
             use_etk=use_etk,
             enforce_chirality=enforce_chirality,
+            rng=rng,
         )
 
-        # Compute seed for this iteration
-        seed = None
-        if base_seed is not None:
-            seed = base_seed + iteration * n_mols
-
-        # Run full pipeline
+        # Run full pipeline (RNG advances naturally through coordgen)
         run_full_pipeline(
             ctx,
             enforce_chirality=enforce_chirality,
             use_exp_torsion=use_exp_torsion,
             use_basic_knowledge=use_basic_knowledge,
             force_tol=force_tol,
-            seed=seed,
+            seed=None,  # RNG is on context, no seed needed
             box_size_mult=box_size_mult,
         )
 
-        # Write back successful conformers
-        for batch_idx in range(len(batch_mols)):
-            mol_idx = need_more[batch_idx]
+        # Write back successful conformers, track per-molecule successes
+        round_mol_successes = [0] * n_mols
+        for entry_idx in range(ctx.n_mols):
+            if not ctx.active[entry_idx] or ctx.failed[entry_idx]:
+                continue
 
-            if ctx.active[batch_idx] and not ctx.failed[batch_idx]:
-                n_atoms = ctx.atom_starts[batch_idx + 1] - ctx.atom_starts[batch_idx]
-                conf_id = _write_conformers(
-                    mols[mol_idx],
-                    ctx.positions,
-                    ctx.atom_starts[batch_idx],
-                    n_atoms,
-                    ctx.dim,
-                )
-                if conf_id >= 0:
-                    confs_generated[mol_idx] += 1
+            # Map entry back to original molecule
+            batch_mol_idx = ctx.entry_mol_map[entry_idx]
+            orig_mol_idx = need_more[batch_mol_idx]
+
+            # Skip if this molecule already has enough conformers
+            if confs_generated[orig_mol_idx] >= confs_per_mol:
+                continue
+
+            n_atoms = ctx.atom_starts[entry_idx + 1] - ctx.atom_starts[entry_idx]
+            conf_id = _write_conformers(
+                mols[orig_mol_idx],
+                ctx.positions,
+                ctx.atom_starts[entry_idx],
+                n_atoms,
+                ctx.dim,
+            )
+            if conf_id >= 0:
+                confs_generated[orig_mol_idx] += 1
+                round_mol_successes[orig_mol_idx] += 1
+
+        # Give up on molecules that had 0 successes this round despite
+        # having enough attempts — they will almost certainly keep failing
+        for i in need_more:
+            if round_mol_successes[i] == 0 and total_attempts[i] >= confs_per_mol:
+                given_up[i] = True
+
+        # Early termination: stop if no molecule produced anything
+        if sum(round_mol_successes) == 0:
+            break

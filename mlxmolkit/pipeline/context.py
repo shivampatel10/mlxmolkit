@@ -72,6 +72,13 @@ class PipelineContext:
     # Bounds matrices (per-molecule, for chiral dist matrix check)
     bounds_matrices: list | None = None
 
+    # Persistent RNG for coordinate generation (advances across pipeline calls)
+    rng: np.random.Generator | None = None
+
+    # Mapping from batch entry index to (unique_mol_index, conf_slot)
+    # Used by multi-conf pipeline to track which molecule each entry belongs to
+    entry_mol_map: list[int] | None = None
+
     def collect_failures(self) -> None:
         """Deactivate failed molecules. Call after each stage."""
         for i in range(self.n_mols):
@@ -402,4 +409,119 @@ def create_pipeline_context(
         stereo_bond_data=stereo_bond_data,
         chiral_dist_data=chiral_dist_data,
         bounds_matrices=bounds_matrices,
+    )
+
+
+def create_pipeline_context_multi_conf(
+    mols: list[Chem.Mol],
+    confs_per_mol: list[int],
+    dim: int = 4,
+    basin_size_tol: float = 1e8,
+    params: "rdDistGeom.EmbedParameters | None" = None,
+    use_etk: bool = False,
+    enforce_chirality: bool = True,
+    rng: np.random.Generator | None = None,
+) -> PipelineContext:
+    """Create a pipeline context with multiple conformer slots per molecule.
+
+    Extracts parameters once per unique molecule, then replicates them for
+    the requested number of conformer attempts. Each conformer slot is
+    treated as an independent entry in the batch.
+
+    Args:
+        mols: Unique RDKit molecules with hydrogens added.
+        confs_per_mol: Number of conformer slots per molecule.
+        dim: Coordinate dimension (4 for ETKDG).
+        basin_size_tol: Basin size tolerance for distance terms.
+        params: Optional RDKit EmbedParameters for ETK extraction.
+        use_etk: Whether to extract ETK parameters.
+        enforce_chirality: Whether to set up chirality check data.
+        rng: Persistent numpy RNG (stored on context, advances across calls).
+
+    Returns:
+        PipelineContext with n_entries = sum(confs_per_mol) batch slots,
+        each mapped back to its source molecule via entry_mol_map.
+    """
+    n_unique = len(mols)
+
+    # Extract per-molecule data ONCE
+    per_mol_dg = []
+    per_mol_tet = []
+    per_mol_etk = []
+    per_mol_bounds = []
+
+    for mol in mols:
+        bounds_mat = get_bounds_matrix(mol)
+        per_mol_bounds.append(bounds_mat)
+        dg_params = extract_dg_params(mol, bounds_mat, dim, basin_size_tol)
+        per_mol_dg.append(dg_params)
+        tet_terms = extract_tetrahedral_atoms(mol)
+        per_mol_tet.append(tet_terms)
+
+        if use_etk:
+            etk = extract_etk_params(mol, bounds_mat, params=params)
+            per_mol_etk.append(etk)
+
+    # Replicate params for each conformer slot
+    dg_params_list = []
+    tet_terms_list = []
+    etk_params_list = []
+    bounds_matrices = []
+    entry_mol_map: list[int] = []  # entry_idx -> unique mol index
+    replicated_mols: list[Chem.Mol] = []  # for double bond / stereo extraction
+
+    for mol_idx in range(n_unique):
+        n_confs = confs_per_mol[mol_idx]
+        for _ in range(n_confs):
+            dg_params_list.append(per_mol_dg[mol_idx])
+            tet_terms_list.append(per_mol_tet[mol_idx])
+            bounds_matrices.append(per_mol_bounds[mol_idx])
+            entry_mol_map.append(mol_idx)
+            replicated_mols.append(mols[mol_idx])
+            if use_etk:
+                etk_params_list.append(per_mol_etk[mol_idx])
+
+    n_entries = len(dg_params_list)
+
+    # Batch using existing functions (they handle atom offsets)
+    dg_system = batch_dg_params(dg_params_list, dim)
+
+    atom_starts_np = np.array(dg_system.atom_starts.tolist(), dtype=np.int32)
+    tet_data = _batch_tetrahedral_terms(tet_terms_list, atom_starts_np)
+
+    atom_starts = dg_system.atom_starts.tolist()
+    n_atoms_total = dg_system.n_atoms_total
+
+    positions = mx.zeros(n_atoms_total * dim, dtype=mx.float32)
+
+    etk_system = None
+    if use_etk and etk_params_list:
+        etk_system = batch_etk_params(etk_params_list, atom_starts, dim)
+
+    double_bond_data = _extract_double_bond_data(replicated_mols, atom_starts)
+    stereo_bond_data = _extract_stereo_bond_data(replicated_mols, atom_starts)
+
+    chiral_dist_data = None
+    if enforce_chirality:
+        chiral_dist_data = _extract_chiral_dist_data(
+            replicated_mols, bounds_matrices, atom_starts, dg_system
+        )
+
+    return PipelineContext(
+        n_mols=n_entries,
+        dim=dim,
+        atom_starts=atom_starts,
+        n_atoms_total=n_atoms_total,
+        positions=positions,
+        active=[True] * n_entries,
+        failed=[False] * n_entries,
+        dg_system=dg_system,
+        tet_data=tet_data,
+        etk_system=etk_system,
+        double_bond_data=double_bond_data,
+        stereo_bond_data=stereo_bond_data,
+        chiral_dist_data=chiral_dist_data,
+        bounds_matrices=bounds_matrices,
+        rng=rng,
+        entry_mol_map=entry_mol_map,
     )

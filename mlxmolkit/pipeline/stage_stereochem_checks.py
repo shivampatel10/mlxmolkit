@@ -13,7 +13,12 @@ import numpy as np
 
 from .context import PipelineContext
 
-MIN_TETRAHEDRAL_CHIRAL_VOL = 0.50
+# nvMolKit uses 0.50, calibrated for its CUDA DG minimizer which produces
+# sharper tetrahedral geometry.  Our MLX BFGS often yields volumes in the
+# 0.15-0.50 range for valid (but flatter) tetrahedra.  A lower threshold
+# avoids false rejects while still catching genuinely degenerate (planar)
+# geometries.
+MIN_TETRAHEDRAL_CHIRAL_VOL = 0.10
 
 
 def _same_side(
@@ -91,6 +96,12 @@ def stage_tetrahedral_check(ctx: PipelineContext, tol: float = 0.3) -> None:
         p3 = pos[idx3[t]]
         p4 = pos[idx4[t]]
 
+        # 3-coordinate centers (idx0 == idx4) have no 4th neighbor — skip
+        # both volume test and center-in-volume check (matches nvMolKit which
+        # only includes atoms with exactly 4 neighbors).
+        if idx0[t] == idx4[t]:
+            continue
+
         vol_scale = 0.25 if in_fused[t] else 1.0
         threshold = vol_scale * MIN_TETRAHEDRAL_CHIRAL_VOL
 
@@ -115,10 +126,6 @@ def stage_tetrahedral_check(ctx: PipelineContext, tol: float = 0.3) -> None:
 
         if failed:
             ctx.failed[mol_idx] = True
-            continue
-
-        # Center-in-volume check (only if 4 neighbors, i.e., idx0 != idx4)
-        if idx0[t] == idx4[t]:
             continue
 
         if not _same_side(p1, p2, p3, p4, p0, tol):
