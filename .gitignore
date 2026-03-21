@@ -13,3 +13,5 @@ wheels/
 docs/_build/
 
 .claude
+*.md
+!README.md
