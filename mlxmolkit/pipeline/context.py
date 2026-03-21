@@ -218,11 +218,12 @@ def _extract_stereo_bond_data(
             s1 = stereo_atoms[0]
             s2 = stereo_atoms[1]
 
-            # Sign: +1 for Z (same side), -1 for E (opposite side)
+            # Sign: -1 for Z/cis (same side), +1 for E/trans (opposite side)
+            # Matches nvMolKit's convention (embedder_utils.cpp:648-651)
             if stereo == Chem.BondStereo.STEREOZ:
-                sign = 1
-            elif stereo == Chem.BondStereo.STEREOE:
                 sign = -1
+            elif stereo == Chem.BondStereo.STEREOE:
+                sign = 1
             else:
                 continue
 
@@ -255,13 +256,19 @@ def _extract_chiral_dist_data(
     """Extract chiral distance matrix check data.
 
     Collects all pairwise distances between atoms involved in chirality
-    for each chiral center and looks up their bounds.
+    (center + all neighbors) for each CW/CCW chiral center and looks up
+    their bounds from the distance bounds matrix.
+
+    Only includes explicitly assigned chiral centers (CW or CCW), matching
+    nvMolKit's ``eargs.chiralCenters`` which excludes unassigned centers.
+    Includes all neighbors (not just 3), matching nvMolKit's ChiralSet
+    which stores center + 4 neighbors.
 
     Args:
         mols: RDKit molecules.
         bounds_matrices: Per-molecule distance bounds matrices.
         atom_starts: Cumulative atom start indices.
-        dg_system: Batched DG system with chiral atom indices.
+        dg_system: Batched DG system (unused, kept for API compat).
 
     Returns:
         Dict with 'idx0', 'idx1', 'lower', 'upper', 'mol_indices' arrays,
@@ -270,6 +277,19 @@ def _extract_chiral_dist_data(
     idx0_list, idx1_list = [], []
     lower_list, upper_list = [], []
     mol_list = []
+
+    # Build a set of CW/CCW chiral center indices per molecule.
+    # nvMolKit's chiralDistMatrixCheck uses only eargs.chiralCenters
+    # (explicitly CW/CCW atoms), not unassigned tetrahedralCenters.
+    mol_cw_ccw = []
+    for mol in mols:
+        cw_ccw = set()
+        for atom in mol.GetAtoms():
+            tag = atom.GetChiralTag()
+            if tag in (Chem.ChiralType.CHI_TETRAHEDRAL_CW,
+                       Chem.ChiralType.CHI_TETRAHEDRAL_CCW):
+                cw_ccw.add(atom.GetIdx())
+        mol_cw_ccw.append(cw_ccw)
 
     chiral_idx1 = np.array(dg_system.chiral_idx1)
     chiral_idx2 = np.array(dg_system.chiral_idx2)
@@ -281,18 +301,29 @@ def _extract_chiral_dist_data(
         offset = atom_starts[i]
         bmat = bounds_matrices[i]
 
-        # Collect all chiral atom indices for this molecule
+        # Collect atoms from chiral terms that belong to CW/CCW centers
         chiral_mask = chiral_mol == i
         if not np.any(chiral_mask):
             continue
 
+        cw_ccw = mol_cw_ccw[i]
+        if not cw_ccw:
+            continue
+
         chiral_atoms = set()
         for t in np.where(chiral_mask)[0]:
-            # Convert global back to local
+            # idx4 is the center atom — only include this term if
+            # the center is a CW/CCW chiral center
+            center_local = int(chiral_idx4[t]) - offset
+            if center_local not in cw_ccw:
+                continue
             for idx_arr in [chiral_idx1, chiral_idx2, chiral_idx3, chiral_idx4]:
                 local = int(idx_arr[t]) - offset
                 if 0 <= local < mol.GetNumAtoms():
                     chiral_atoms.add(local)
+
+        if not chiral_atoms:
+            continue
 
         chiral_atoms = sorted(chiral_atoms)
         for j in range(len(chiral_atoms)):
