@@ -556,3 +556,119 @@ def create_pipeline_context_multi_conf(
         rng=rng,
         entry_mol_map=entry_mol_map,
     )
+
+
+def extract_mol_params_cache(
+    mols: list[Chem.Mol],
+    dim: int = 4,
+    basin_size_tol: float = 1e8,
+    params: "rdDistGeom.EmbedParameters | None" = None,
+    use_etk: bool = False,
+) -> list[tuple]:
+    """Pre-extract per-molecule parameters for caching across retry rounds.
+
+    Returns a list of (bounds_mat, dg_params, tet_terms, etk_params) tuples,
+    one per molecule. etk_params is None if use_etk is False.
+    """
+    cache = []
+    for mol in mols:
+        bounds_mat = get_bounds_matrix(mol)
+        dg_params = extract_dg_params(mol, bounds_mat, dim, basin_size_tol)
+        tet_terms = extract_tetrahedral_atoms(mol)
+        etk = extract_etk_params(mol, bounds_mat, params=params) if use_etk else None
+        cache.append((bounds_mat, dg_params, tet_terms, etk))
+    return cache
+
+
+def create_pipeline_context_from_cache(
+    mols: list[Chem.Mol],
+    mol_cache: list[tuple],
+    confs_per_mol: list[int],
+    dim: int = 4,
+    use_etk: bool = False,
+    enforce_chirality: bool = True,
+    rng: np.random.Generator | None = None,
+) -> PipelineContext:
+    """Create a pipeline context from pre-extracted per-molecule parameters.
+
+    Same as create_pipeline_context_multi_conf but skips the expensive
+    RDKit parameter extraction, using cached results instead.
+
+    Args:
+        mols: Unique RDKit molecules with hydrogens added.
+        mol_cache: Pre-extracted params from extract_mol_params_cache().
+        confs_per_mol: Number of conformer slots per molecule.
+        dim: Coordinate dimension (4 for ETKDG).
+        use_etk: Whether ETK parameters were extracted.
+        enforce_chirality: Whether to set up chirality check data.
+        rng: Persistent numpy RNG.
+
+    Returns:
+        PipelineContext with sum(confs_per_mol) batch slots.
+    """
+    n_unique = len(mols)
+
+    # Replicate cached params for each conformer slot
+    dg_params_list = []
+    tet_terms_list = []
+    etk_params_list = []
+    bounds_matrices = []
+    entry_mol_map: list[int] = []
+    replicated_mols: list[Chem.Mol] = []
+
+    for mol_idx in range(n_unique):
+        bounds_mat, dg_params, tet_terms, etk = mol_cache[mol_idx]
+        n_confs = confs_per_mol[mol_idx]
+        for _ in range(n_confs):
+            dg_params_list.append(dg_params)
+            tet_terms_list.append(tet_terms)
+            bounds_matrices.append(bounds_mat)
+            entry_mol_map.append(mol_idx)
+            replicated_mols.append(mols[mol_idx])
+            if use_etk and etk is not None:
+                etk_params_list.append(etk)
+
+    n_entries = len(dg_params_list)
+
+    # Batch using existing functions
+    dg_system = batch_dg_params(dg_params_list, dim)
+
+    atom_starts_np = np.array(dg_system.atom_starts.tolist(), dtype=np.int32)
+    tet_data = _batch_tetrahedral_terms(tet_terms_list, atom_starts_np)
+
+    atom_starts = dg_system.atom_starts.tolist()
+    n_atoms_total = dg_system.n_atoms_total
+
+    positions = mx.zeros(n_atoms_total * dim, dtype=mx.float32)
+
+    etk_system = None
+    if use_etk and etk_params_list:
+        etk_system = batch_etk_params(etk_params_list, atom_starts, dim)
+
+    double_bond_data = _extract_double_bond_data(replicated_mols, atom_starts)
+    stereo_bond_data = _extract_stereo_bond_data(replicated_mols, atom_starts)
+
+    chiral_dist_data = None
+    if enforce_chirality:
+        chiral_dist_data = _extract_chiral_dist_data(
+            replicated_mols, bounds_matrices, atom_starts, dg_system
+        )
+
+    return PipelineContext(
+        n_mols=n_entries,
+        dim=dim,
+        atom_starts=atom_starts,
+        n_atoms_total=n_atoms_total,
+        positions=positions,
+        active=[True] * n_entries,
+        failed=[False] * n_entries,
+        dg_system=dg_system,
+        tet_data=tet_data,
+        etk_system=etk_system,
+        double_bond_data=double_bond_data,
+        stereo_bond_data=stereo_bond_data,
+        chiral_dist_data=chiral_dist_data,
+        bounds_matrices=bounds_matrices,
+        rng=rng,
+        entry_mol_map=entry_mol_map,
+    )

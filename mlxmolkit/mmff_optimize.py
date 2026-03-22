@@ -28,9 +28,9 @@ def _run_bfgs(
 ) -> tuple[mx.array, mx.array]:
     """Run BFGS minimization, preferring Metal kernel with pure-MLX fallback."""
     try:
-        from .metal_kernels.mmff_bfgs import metal_mmff_bfgs
+        from .metal_kernels.mmff_bfgs import metal_mmff_bfgs_tg
 
-        final_pos, final_energies, _ = metal_mmff_bfgs(
+        final_pos, final_energies, _ = metal_mmff_bfgs_tg(
             pos, system, max_iters=max_iters
         )
         return final_pos, final_energies

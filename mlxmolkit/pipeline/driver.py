@@ -8,7 +8,13 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
-from .context import PipelineContext, create_pipeline_context, create_pipeline_context_multi_conf
+from .context import (
+    PipelineContext,
+    create_pipeline_context,
+    create_pipeline_context_from_cache,
+    create_pipeline_context_multi_conf,
+    extract_mol_params_cache,
+)
 from .stage_coordgen import stage_coordgen
 from .stage_distgeom_minimize import stage_distgeom_minimize
 from .stage_etk_minimize import stage_etk_minimize
@@ -193,6 +199,34 @@ def _write_conformers(
     return mol.AddConformer(conf, assignId=True)
 
 
+def _write_conformers_np(
+    mol: Chem.Mol,
+    pos_np: np.ndarray,
+    atom_start: int,
+    n_atoms: int,
+) -> int:
+    """Write 3D coordinates from a pre-converted numpy array to RDKit conformer.
+
+    Args:
+        mol: RDKit molecule to add the conformer to.
+        pos_np: Numpy positions array, shape (n_atoms_total, dim).
+        atom_start: Start index of this molecule's atoms.
+        n_atoms: Number of atoms in this molecule.
+
+    Returns:
+        Conformer ID of the added conformer.
+    """
+    conf = Chem.Conformer(n_atoms)
+    for j in range(n_atoms):
+        conf.SetAtomPosition(j, (
+            float(pos_np[atom_start + j, 0]),
+            float(pos_np[atom_start + j, 1]),
+            float(pos_np[atom_start + j, 2]),
+        ))
+    conf.SetId(mol.GetNumConformers())
+    return mol.AddConformer(conf, assignId=True)
+
+
 def embed_molecules_pipeline(
     mols: list[Chem.Mol],
     params: rdDistGeom.EmbedParameters,
@@ -250,6 +284,14 @@ def embed_molecules_pipeline(
     max_retries = 3
     overshoot_factor = 3
 
+    # Pre-extract per-molecule params once (expensive RDKit calls).
+    # Cached params are reused across all retry rounds.
+    mol_params_cache = extract_mol_params_cache(
+        mols, dim=4, basin_size_tol=1e8,
+        params=params if use_etk else None,
+        use_etk=use_etk,
+    )
+
     for retry_round in range(max_retries + 1):
         # Determine which molecules still need conformers
         need_more = [
@@ -271,18 +313,18 @@ def embed_molecules_pipeline(
             ]
 
         batch_mols = [mols[i] for i in need_more]
+        batch_cache = [mol_params_cache[i] for i in need_more]
 
         # Track attempts
         for idx, i in enumerate(need_more):
             total_attempts[i] += slots_per_mol[idx]
 
-        # Create multi-conf context (params extracted once, replicated)
-        ctx = create_pipeline_context_multi_conf(
+        # Create multi-conf context from cached params (skips RDKit extraction)
+        ctx = create_pipeline_context_from_cache(
             batch_mols,
+            mol_cache=batch_cache,
             confs_per_mol=slots_per_mol,
             dim=4,
-            basin_size_tol=1e8,
-            params=params if use_etk else None,
             use_etk=use_etk,
             enforce_chirality=enforce_chirality,
             rng=rng,
@@ -300,6 +342,9 @@ def embed_molecules_pipeline(
         )
 
         # Write back successful conformers, track per-molecule successes
+        mx.eval(ctx.positions)
+        pos_np = np.array(ctx.positions).reshape(-1, ctx.dim)
+
         round_mol_successes = [0] * n_mols
         for entry_idx in range(ctx.n_mols):
             if not ctx.active[entry_idx] or ctx.failed[entry_idx]:
@@ -314,12 +359,9 @@ def embed_molecules_pipeline(
                 continue
 
             n_atoms = ctx.atom_starts[entry_idx + 1] - ctx.atom_starts[entry_idx]
-            conf_id = _write_conformers(
-                mols[orig_mol_idx],
-                ctx.positions,
-                ctx.atom_starts[entry_idx],
-                n_atoms,
-                ctx.dim,
+            atom_start = ctx.atom_starts[entry_idx]
+            conf_id = _write_conformers_np(
+                mols[orig_mol_idx], pos_np, atom_start, n_atoms,
             )
             if conf_id >= 0:
                 confs_generated[orig_mol_idx] += 1
