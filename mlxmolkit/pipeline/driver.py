@@ -1,6 +1,6 @@
 """Pipeline driver for full ETKDG pipeline.
 
-Orchestrates all 7 stages with retry loop for failed conformers.
+Orchestrates all 7 stages with retry scheduling for failed conformers.
 """
 
 import mlx.core as mx
@@ -26,6 +26,66 @@ from .stage_stereochem_checks import (
     stage_first_chiral_check,
     stage_tetrahedral_check,
 )
+
+
+class _RoundRobinRetryScheduler:
+    """Dispatch conformer attempts in round-robin waves.
+
+    Mirrors nvMolKit's scheduler structure: each round permits one additional
+    `confs_per_mol` wave of attempts for molecules still short of the target.
+    """
+
+    def __init__(
+        self,
+        n_mols: int,
+        confs_per_mol: int,
+        max_iterations: int,
+    ) -> None:
+        if n_mols <= 0 or confs_per_mol <= 0 or max_iterations <= 0:
+            raise ValueError("Scheduler parameters must be greater than 0")
+
+        self.n_mols = n_mols
+        self.confs_per_mol = confs_per_mol
+        self.max_attempts_per_mol = max_iterations * confs_per_mol
+        self.completed_confs = [0] * n_mols
+        self.total_attempts = [0] * n_mols
+        self.round_robin_iter = 1
+
+    def dispatch(self, batch_size: int) -> list[int]:
+        """Return a batch of molecule ids to attempt next."""
+        if batch_size <= 0:
+            return []
+
+        mol_ids: list[int] = []
+        max_attempts_this_round = min(
+            self.max_attempts_per_mol,
+            self.confs_per_mol * self.round_robin_iter,
+        )
+        for mol_idx in range(self.n_mols):
+            while (
+                self.completed_confs[mol_idx] < self.confs_per_mol
+                and self.total_attempts[mol_idx] < max_attempts_this_round
+            ):
+                if len(mol_ids) >= batch_size:
+                    break
+                mol_ids.append(mol_idx)
+                self.total_attempts[mol_idx] += 1
+            if len(mol_ids) >= batch_size:
+                break
+
+        if self.total_attempts[-1] == max_attempts_this_round:
+            self.round_robin_iter += 1
+
+        return mol_ids
+
+    def record(self, mol_ids: list[int], completed: list[bool]) -> None:
+        """Record which attempts succeeded."""
+        if len(mol_ids) != len(completed):
+            raise ValueError("mol_ids and completed must have the same size")
+
+        for mol_idx, did_complete in zip(mol_ids, completed, strict=True):
+            if did_complete:
+                self.completed_confs[mol_idx] += 1
 
 
 def run_dg_pipeline(
@@ -235,11 +295,9 @@ def embed_molecules_pipeline(
 ) -> None:
     """Full ETKDG embedding pipeline with batched multi-conformer generation.
 
-    Generates conformers using a bulk batch approach: all molecules are
-    replicated for the requested number of conformers and processed in a
-    single GPU pipeline pass. Failed conformers are retried in batched
-    rounds with overshoot (3x what's needed) until all molecules have
-    enough conformers or max retries are exhausted.
+    Generates conformers using repeated GPU pipeline passes. Each pass uses a
+    round-robin retry scheduler so molecules that still need conformers get one
+    additional wave of attempts, instead of a fixed overshoot multiplier.
 
     A persistent RNG advances across all pipeline passes (matching
     nvMolKit's global RNG), ensuring each conformer attempt sees
@@ -273,16 +331,10 @@ def embed_molecules_pipeline(
     base_seed = params.randomSeed if params.randomSeed >= 0 else None
     rng = np.random.default_rng(base_seed)
 
-    # Track conformers generated and attempts per molecule
-    confs_generated = [0] * n_mols
-    total_attempts = [0] * n_mols
-    # Molecules with 0% success after a full round are marked as given up
-    given_up = [False] * n_mols
-
-    # Retry strategy: bulk first pass + up to 3 retry rounds with overshoot.
-    # Only retry molecules that showed >0% success rate in prior rounds.
-    max_retries = 3
-    overshoot_factor = 3
+    # Track how many conformers were written back per molecule.
+    confs_written = [0] * n_mols
+    scheduler = _RoundRobinRetryScheduler(n_mols, confs_per_mol, max_iterations)
+    dispatch_batch_size = n_mols * confs_per_mol
 
     # Pre-extract per-molecule params once (expensive RDKit calls).
     # Cached params are reused across all retry rounds.
@@ -292,32 +344,24 @@ def embed_molecules_pipeline(
         use_etk=use_etk,
     )
 
-    for retry_round in range(max_retries + 1):
-        # Determine which molecules still need conformers
-        need_more = [
-            i for i in range(n_mols)
-            if confs_generated[i] < confs_per_mol and not given_up[i]
-        ]
-        if not need_more:
+    while True:
+        mol_ids = scheduler.dispatch(dispatch_batch_size)
+        if not mol_ids:
             break
 
-        # Compute how many conformer slots to request per molecule
-        if retry_round == 0:
-            # First pass: request exactly what's needed
-            slots_per_mol = [confs_per_mol] * len(need_more)
-        else:
-            # Retries: overshoot to fill remaining, capped at 3× needed
-            slots_per_mol = [
-                (confs_per_mol - confs_generated[i]) * overshoot_factor
-                for i in need_more
-            ]
-
-        batch_mols = [mols[i] for i in need_more]
-        batch_cache = [mol_params_cache[i] for i in need_more]
-
-        # Track attempts
-        for idx, i in enumerate(need_more):
-            total_attempts[i] += slots_per_mol[idx]
+        slots_by_mol = np.bincount(
+            np.array(mol_ids, dtype=np.int32),
+            minlength=n_mols,
+        ).tolist()
+        batch_mol_ids = [i for i, slots in enumerate(slots_by_mol) if slots > 0]
+        slots_per_mol = [slots_by_mol[i] for i in batch_mol_ids]
+        batch_mols = [mols[i] for i in batch_mol_ids]
+        batch_cache = [mol_params_cache[i] for i in batch_mol_ids]
+        entry_mol_ids = [
+            mol_idx
+            for mol_idx, slots in zip(batch_mol_ids, slots_per_mol, strict=True)
+            for _ in range(slots)
+        ]
 
         # Create multi-conf context from cached params (skips RDKit extraction)
         ctx = create_pipeline_context_from_cache(
@@ -345,17 +389,18 @@ def embed_molecules_pipeline(
         mx.eval(ctx.positions)
         pos_np = np.array(ctx.positions).reshape(-1, ctx.dim)
 
-        round_mol_successes = [0] * n_mols
+        completed = [False] * ctx.n_mols
         for entry_idx in range(ctx.n_mols):
             if not ctx.active[entry_idx] or ctx.failed[entry_idx]:
                 continue
+            completed[entry_idx] = True
 
             # Map entry back to original molecule
             batch_mol_idx = ctx.entry_mol_map[entry_idx]
-            orig_mol_idx = need_more[batch_mol_idx]
+            orig_mol_idx = batch_mol_ids[batch_mol_idx]
 
             # Skip if this molecule already has enough conformers
-            if confs_generated[orig_mol_idx] >= confs_per_mol:
+            if confs_written[orig_mol_idx] >= confs_per_mol:
                 continue
 
             n_atoms = ctx.atom_starts[entry_idx + 1] - ctx.atom_starts[entry_idx]
@@ -364,15 +409,10 @@ def embed_molecules_pipeline(
                 mols[orig_mol_idx], pos_np, atom_start, n_atoms,
             )
             if conf_id >= 0:
-                confs_generated[orig_mol_idx] += 1
-                round_mol_successes[orig_mol_idx] += 1
+                confs_written[orig_mol_idx] += 1
 
-        # Give up on molecules that had 0 successes this round despite
-        # having enough attempts — they will almost certainly keep failing
-        for i in need_more:
-            if round_mol_successes[i] == 0 and total_attempts[i] >= confs_per_mol:
-                given_up[i] = True
+        scheduler.record(entry_mol_ids, completed)
 
         # Early termination: stop if no molecule produced anything
-        if sum(round_mol_successes) == 0:
+        if not any(completed):
             break
