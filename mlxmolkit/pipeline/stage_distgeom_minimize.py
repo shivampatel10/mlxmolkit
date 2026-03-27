@@ -64,6 +64,46 @@ def _try_metal_dg_lbfgs(
         return None
 
 
+def _try_metal_dg_bfgs_tg(
+    ctx: PipelineContext,
+    system: "BatchedDGSystem",
+    chiral_weight: float,
+    fourth_dim_weight: float,
+    max_iters: int,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """Try Metal DG BFGS threadgroup kernel.
+
+    Args:
+        ctx: Pipeline context with positions and atom layout.
+        system: Batched distance geometry system.
+        chiral_weight: Weight for chiral violation terms.
+        fourth_dim_weight: Weight for fourth dimension penalty.
+        max_iters: Maximum BFGS iterations.
+
+    Returns:
+        Tuple of (positions, energies, statuses) arrays, or None on failure.
+    """
+    try:
+        from ..metal_kernels.dg_bfgs import metal_dg_bfgs_tg
+
+        max_atoms = max(
+            ctx.atom_starts[i + 1] - ctx.atom_starts[i]
+            for i in range(ctx.n_mols)
+        )
+        if max_atoms > _METAL_MAX_ATOMS:
+            return None
+
+        result = metal_dg_bfgs_tg(
+            ctx.positions, system, chiral_weight, fourth_dim_weight,
+            max_iters=max_iters,
+        )
+        mx.eval(*result)
+        return result
+    except Exception as e:
+        log.debug("Metal DG BFGS TG unavailable, falling back: %s", e)
+        return None
+
+
 def _try_metal_dg_bfgs(
     ctx: PipelineContext,
     system: "BatchedDGSystem",
@@ -162,7 +202,7 @@ def stage_distgeom_minimize(
         max_iters: Maximum BFGS iterations.
         check_energy: If True, fail molecules with energy per atom >= 0.05.
         minimizer: Which minimizer to use.
-            'metal' (default) -- Metal L-BFGS -> dense BFGS -> vectorized -> original.
+            'metal' (default) -- Metal L-BFGS TG -> BFGS TG -> serial BFGS -> vectorized -> original.
             'vectorized' -- vectorized Python BFGS (~58x speedup).
             'original' -- original per-molecule BFGS (slowest, for debugging).
 
@@ -172,9 +212,12 @@ def stage_distgeom_minimize(
     system = ctx.dg_system
     result = None
 
-    # Cascade: L-BFGS -> dense BFGS -> vectorized -> original
+    # Cascade: L-BFGS TG -> BFGS TG -> serial BFGS -> vectorized -> original
     if minimizer == "metal":
         result = _try_metal_dg_lbfgs(ctx, system, chiral_weight, fourth_dim_weight, max_iters)
+
+    if result is None and minimizer == "metal":
+        result = _try_metal_dg_bfgs_tg(ctx, system, chiral_weight, fourth_dim_weight, max_iters)
 
     if result is None and minimizer == "metal":
         result = _try_metal_dg_bfgs(ctx, system, chiral_weight, fourth_dim_weight, max_iters)

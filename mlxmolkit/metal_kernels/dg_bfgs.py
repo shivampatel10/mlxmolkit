@@ -229,6 +229,117 @@ def metal_dg_bfgs(
     return out_pos, out_energies, out_statuses
 
 
+# ---- Threadgroup kernel (TG) ----
+
+# Default threads per molecule (must be power of 2 for tree reduction)
+DEFAULT_TPM = 32
+
+# Load TG MSL source from external .metal file
+_tg_metal_source = (_KERNEL_DIR / "dg_bfgs_tg.metal").read_text()
+_TG_MSL_HEADER, _TG_MSL_SOURCE = _tg_metal_source.split(
+    "// ---- DG_BFGS_TG_SPLIT ----\n"
+)
+del _tg_metal_source
+
+
+def metal_dg_bfgs_tg(
+    pos: mx.array,
+    system: BatchedDGSystem,
+    chiral_weight: float = 1.0,
+    fourth_dim_weight: float = 0.1,
+    max_iters: int = 400,
+    grad_tol: float | None = None,
+    tpm: int = DEFAULT_TPM,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Run DG BFGS minimization on-device with threadgroup parallelism.
+
+    One threadgroup per molecule. Energy evaluation, line search, Hessian
+    ops, and convergence checks are parallelized across TPM threads.
+    Gradient computation remains serial (thread 0) to avoid atomics.
+
+    Args:
+        pos: Initial flat positions, shape ``(n_atoms_total * dim,)``, float32.
+        system: Batched DG system with all energy terms pre-packed.
+        chiral_weight: Weight for chiral violation energy terms.
+        fourth_dim_weight: Weight for fourth-dimension penalty terms.
+        max_iters: Maximum number of BFGS iterations per molecule.
+        grad_tol: Gradient convergence tolerance. Defaults to
+            ``DEFAULT_GRAD_TOL``.
+        tpm: Threads per molecule (must be a power of 2, e.g. 1, 8, 32).
+
+    Returns:
+        Tuple of ``(final_pos, final_energies, statuses)`` where
+        *final_pos* has the same shape as *pos*, *final_energies* is
+        shape ``(n_mols,)`` float32, and *statuses* is shape ``(n_mols,)``
+        int32 (0 = converged, 1 = active/not converged).
+    """
+    if grad_tol is None:
+        grad_tol = DEFAULT_GRAD_TOL
+
+    n_mols = system.n_mols
+    dim = system.dim
+
+    # Pack inputs — same preprocessing as serial kernel
+    inputs = _pack_kernel_inputs(system, chiral_weight, fourth_dim_weight,
+                                  max_iters, grad_tol)
+
+    total_pos_size = inputs['total_pos_size']
+    total_hessian_size = inputs['total_hessian_size']
+
+    # Build kernel with template parameters
+    kernel = mx.fast.metal_kernel(
+        name="dg_bfgs_tg",
+        input_names=[
+            "pos", "atom_starts", "hessian_starts",
+            "dist_pairs", "dist_bounds", "dist_term_starts",
+            "chiral_quads", "chiral_bounds", "chiral_term_starts",
+            "fourth_idx_arr", "fourth_term_starts_arr", "config",
+        ],
+        output_names=[
+            "out_pos", "out_energies", "out_statuses",
+            "work_grad", "work_dir", "work_scratch", "work_hessian",
+        ],
+        header=_TG_MSL_HEADER,
+        source=_TG_MSL_SOURCE,
+    )
+
+    # Launch: one threadgroup per molecule, TPM threads per threadgroup
+    outputs = kernel(
+        inputs=[
+            pos,
+            inputs['atom_starts'],
+            inputs['hessian_starts'],
+            inputs['dist_pairs'],
+            inputs['dist_bounds'],
+            inputs['dist_term_starts'],
+            inputs['chiral_quads'],
+            inputs['chiral_bounds'],
+            inputs['chiral_term_starts'],
+            inputs['fourth_idx_arr'],
+            inputs['fourth_term_starts_arr'],
+            inputs['config'],
+        ],
+        output_shapes=[
+            (total_pos_size,),       # out_pos
+            (n_mols,),               # out_energies
+            (n_mols,),               # out_statuses
+            (total_pos_size,),       # work_grad
+            (total_pos_size,),       # work_dir
+            (total_pos_size * 3,),   # work_scratch
+            (max(total_hessian_size, 1),),  # work_hessian
+        ],
+        output_dtypes=[
+            mx.float32, mx.float32, mx.int32,
+            mx.float32, mx.float32, mx.float32, mx.float32,
+        ],
+        grid=(n_mols * tpm, 1, 1),
+        threadgroup=(tpm, 1, 1),
+        template=[("TPM", tpm), ("total_pos_size", total_pos_size)],
+    )
+
+    return outputs[0], outputs[1], outputs[2]
+
+
 def metal_dg_bfgs_binned(
     pos: mx.array,
     system: BatchedDGSystem,
