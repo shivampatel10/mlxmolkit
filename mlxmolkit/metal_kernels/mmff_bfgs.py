@@ -25,6 +25,8 @@ constant float MOVETOL = 1e-6f;
 constant float EPS_GUARD = 3e-7f;
 constant float MAX_STEP_FACTOR = 100.0f;
 constant int MAX_LS_ITERS = 1000;
+constant float GRAD_SCALE_INIT = 0.1f;
+constant float GRAD_CAP = 10.0f;
 constant float DEG_TO_RAD = 3.14159265358979323846f / 180.0f;
 constant float RAD_TO_DEG = 180.0f / 3.14159265358979323846f;
 
@@ -448,6 +450,27 @@ inline float parallel_dot(const device float* a, const device float* b,
     shared[tid] = local_sum;
     return tg_reduce_sum(shared, tid, tpm);
 }
+
+inline void scale_grad_serial(device float* grad, int n_terms, thread float& grad_scale, bool pre_loop) {
+    if (pre_loop) {
+        grad_scale = GRAD_SCALE_INIT;
+    }
+    float scale = grad_scale;
+    float max_grad = 0.0f;
+    for (int i = 0; i < n_terms; i++) {
+        grad[i] *= scale;
+        max_grad = max(max_grad, abs(grad[i]));
+    }
+    while (max_grad > GRAD_CAP) {
+        scale *= 0.5f;
+        max_grad = 0.0f;
+        for (int i = 0; i < n_terms; i++) {
+            grad[i] *= 0.5f;
+            max_grad = max(max_grad, abs(grad[i]));
+        }
+    }
+    grad_scale = scale;
+}
 """
 
 # MSL kernel body — one thread per molecule
@@ -562,7 +585,9 @@ _MSL_SOURCE = """
 
     // ---- Compute initial energy + gradient ----
     float energy;
+    float grad_scale = 1.0f;
     COMPUTE_ENERGY_GRAD(energy);
+    scale_grad_serial(my_grad, n_terms, grad_scale, true);
 
     // Initial direction = -grad
     for (int i = 0; i < n_terms; i++) my_dir[i] = -my_grad[i];
@@ -591,6 +616,7 @@ _MSL_SOURCE = """
 
         float slope = 0.0f;
         for (int i = 0; i < n_terms; i++) slope += my_dir[i] * my_grad[i];
+        if (slope >= 0.0f) { status = 0; break; }
 
         float test_max = 0.0f;
         for (int i = 0; i < n_terms; i++) {
@@ -663,6 +689,7 @@ _MSL_SOURCE = """
         // New gradient
         for (int i = 0; i < n_terms; i++) { my_dgrad[i] = my_grad[i]; }
         COMPUTE_ENERGY_GRAD(energy);
+        scale_grad_serial(my_grad, n_terms, grad_scale, false);
         for (int i = 0; i < n_terms; i++) my_dgrad[i] = my_grad[i] - my_dgrad[i];
 
         // Gradient convergence check
@@ -671,7 +698,7 @@ _MSL_SOURCE = """
             float tv = abs(my_grad[i]) * max(abs(my_pos[i]), 1.0f);
             if (tv > grad_test) grad_test = tv;
         }
-        if (grad_test / max(energy, 1.0f) < grad_tol) { status = 0; break; }
+        if (grad_test / max(energy * grad_scale, 1.0f) < grad_tol) { status = 0; break; }
 
         // BFGS Hessian update
         for (int i = 0; i < n_terms; i++) {
@@ -955,6 +982,7 @@ _MSL_SOURCE_TG = """
 
     // Only tg_reduce (work array) and tg_status_shared remain as threadgroup-shared
     threadgroup float tg_reduce[TG_SIZE_VAL];
+    threadgroup float tg_grad_scale_shared;
     threadgroup int tg_status_shared;
 
     // Initialize Hessian to identity (ALL threads)
@@ -1030,7 +1058,12 @@ _MSL_SOURCE_TG = """
     // ---- Initial energy + gradient (thread 0 computes, broadcast energy) ----
     float energy = 0.0f;
     SEQ_COMPUTE_EG(energy);
-    if (tid == 0) tg_reduce[0] = energy;
+    if (tid == 0) {
+        float grad_scale = 1.0f;
+        scale_grad_serial(my_grad, n_terms, grad_scale, true);
+        tg_grad_scale_shared = grad_scale;
+        tg_reduce[0] = energy;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     energy = tg_reduce[0];
 
@@ -1067,6 +1100,11 @@ _MSL_SOURCE_TG = """
 
         // Slope = dir . grad (parallel dot — all threads get same result)
         float slope = parallel_dot(my_dir, my_grad, n_terms, tid, tg_size, tg_reduce);
+        if (slope >= 0.0f) {
+            if (tid == 0) tg_status_shared = 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            break;
+        }
 
         // Lambda min (parallel max reduction)
         float local_test_max = 0.0f;
@@ -1178,7 +1216,12 @@ _MSL_SOURCE_TG = """
         threadgroup_barrier(mem_flags::mem_device);
         float new_e = 0.0f;
         SEQ_COMPUTE_EG(new_e);
-        if (tid == 0) tg_reduce[0] = new_e;
+        if (tid == 0) {
+            float grad_scale = tg_grad_scale_shared;
+            scale_grad_serial(my_grad, n_terms, grad_scale, false);
+            tg_grad_scale_shared = grad_scale;
+            tg_reduce[0] = new_e;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         energy = tg_reduce[0];
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dgrad[i] = my_grad[i] - my_dgrad[i];
@@ -1196,7 +1239,7 @@ _MSL_SOURCE_TG = """
             if (tid < s) tg_reduce[tid] = max(tg_reduce[tid], tg_reduce[tid + s]);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        if (tg_reduce[0] / max(energy, 1.0f) < grad_tol) {
+        if (tg_reduce[0] / max(energy * tg_grad_scale_shared, 1.0f) < grad_tol) {
             if (tid == 0) tg_status_shared = 0;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             break;

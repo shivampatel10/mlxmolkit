@@ -20,6 +20,8 @@ from .bfgs import (
     DEFAULT_GRAD_TOL,
     EPS,
     FUNCTOL,
+    GRAD_CAP,
+    GRAD_SCALE_INIT,
     MAX_LINESEARCH_ITERS,
     MAX_STEP_FACTOR,
     MOVETOL,
@@ -144,6 +146,31 @@ def _compute_max_step_vec(
     return MAX_STEP_FACTOR * mx.maximum(mx.sqrt(sum_sq), n_terms)
 
 
+def _scale_grad_vec(
+    grad_padded: mx.array,
+    dim_mask: mx.array,
+    grad_scale: mx.array,
+    pre_loop: bool,
+) -> tuple[mx.array, mx.array]:
+    """Match RDKit's per-molecule gradient scaling in vectorized form."""
+    if pre_loop:
+        grad_scale = mx.ones_like(grad_scale) * GRAD_SCALE_INIT
+
+    scaled_grad = grad_padded * grad_scale[:, None]
+    scaled_grad = mx.where(dim_mask, scaled_grad, 0.0)
+    max_grad = mx.max(mx.abs(scaled_grad), axis=1)
+    needs_rescale = max_grad > GRAD_CAP
+
+    while mx.any(needs_rescale).item():
+        grad_scale = mx.where(needs_rescale, grad_scale * 0.5, grad_scale)
+        scaled_grad = grad_padded * grad_scale[:, None]
+        scaled_grad = mx.where(dim_mask, scaled_grad, 0.0)
+        max_grad = mx.max(mx.abs(scaled_grad), axis=1)
+        needs_rescale = max_grad > GRAD_CAP
+
+    return scaled_grad, grad_scale
+
+
 def bfgs_minimize_vectorized(
     energy_and_grad_fn: Callable[[mx.array], tuple[mx.array, mx.array]],
     pos: mx.array,
@@ -203,15 +230,17 @@ def bfgs_minimize_vectorized(
     grad_padded = _flat_to_padded(grad_flat, flat_to_padded_idx, n_mols, max_dim)
     pos_padded = _flat_to_padded(pos, flat_to_padded_idx, n_mols, max_dim)
 
+    grad_scale = mx.ones(n_mols, dtype=mx.float32)
+    grad_padded, grad_scale = _scale_grad_vec(
+        grad_padded, dim_mask, grad_scale, pre_loop=True
+    )
+
     # Initial direction = -grad
     dir_padded = -grad_padded * dim_mask
 
     # Compute max step per molecule
     max_steps = _compute_max_step_vec(pos_padded, dim_mask, n_mols, max_dim, dim)
-    mx.eval(H_batch, grad_padded, pos_padded, dir_padded, max_steps)
-
-    # Grad scale = 1 (no scaling in vectorized version, matching pipeline usage)
-    grad_scale = mx.ones(n_mols, dtype=mx.float32)
+    mx.eval(H_batch, grad_padded, pos_padded, dir_padded, max_steps, grad_scale)
 
     # Main BFGS loop
     for iteration in range(max_iters):
@@ -238,6 +267,9 @@ def bfgs_minimize_vectorized(
         energies, grad_flat = energy_and_grad_fn(pos)
         mx.eval(energies, grad_flat)
         grad_padded = _flat_to_padded(grad_flat, flat_to_padded_idx, n_mols, max_dim)
+        grad_padded, grad_scale = _scale_grad_vec(
+            grad_padded, dim_mask, grad_scale, pre_loop=False
+        )
 
         # === GRADIENT CONVERGENCE CHECK ===
         abs_grad = mx.abs(grad_padded) * mx.maximum(mx.abs(pos_padded), 1.0)
@@ -315,6 +347,7 @@ def _line_search_vec(
 
     # Compute slope = dir . grad (vectorized)
     slopes = mx.sum(dir_scaled * grad_padded * dim_mask, axis=1)  # (n_mols,)
+    bad_direction = slopes >= 0.0
 
     # Compute lambda_min (vectorized)
     abs_dir = mx.abs(dir_scaled)
@@ -332,7 +365,7 @@ def _line_search_vec(
     best_pos_flat = old_pos_flat
 
     # ls_active: True = still searching
-    ls_active = active
+    ls_active = active & (~bad_direction)
 
     for ls_iter in range(MAX_LINESEARCH_ITERS):
         if not mx.any(ls_active).item():

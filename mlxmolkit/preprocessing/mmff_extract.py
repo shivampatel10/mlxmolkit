@@ -13,6 +13,10 @@ from rdkit import Chem
 from rdkit.Chem import rdForceFieldHelpers
 
 
+# RDKit MMFFProp::linh is set for atom types 4, 53, and 61 in Params.cpp.
+_MMFF_LINEAR_ATOM_TYPES = frozenset({4, 53, 61})
+
+
 @dataclass
 class BondStretchTerms:
     """MMFF bond stretch terms."""
@@ -120,10 +124,16 @@ def _empty_bool(n=0):
     return np.array([], dtype=bool) if n == 0 else np.zeros(n, dtype=bool)
 
 
+def _is_mmff_linear_atom_type(atom_type: int) -> bool:
+    """Return RDKit MMFFProp::linh semantics for the given atom type."""
+    return atom_type in _MMFF_LINEAR_ATOM_TYPES
+
+
 def extract_mmff_params(
     mol: Chem.Mol,
     conf_id: int = -1,
     nonBondedThreshold: float = 100.0,
+    ignoreInterfragInteractions: bool = True,
 ) -> MMFFParams | None:
     """Extract MMFF94 parameters from an RDKit molecule.
 
@@ -131,6 +141,8 @@ def extract_mmff_params(
         mol: RDKit molecule with hydrogens and at least one conformer.
         conf_id: Conformer ID for non-bonded distance filtering.
         nonBondedThreshold: Distance cutoff for non-bonded terms (Angstroms).
+        ignoreInterfragInteractions: Whether to exclude non-bonded interactions
+            between disconnected fragments. Matches RDKit MMFF defaults.
 
     Returns:
         MMFFParams or None if molecule lacks valid MMFF atom types.
@@ -189,7 +201,7 @@ def extract_mmff_params(
                     # res = (angleType, ka, theta0)
                     ka_val = float(res[1])
                     theta0_val = float(res[2])
-                    is_lin = theta0_val >= 175.0
+                    is_lin = _is_mmff_linear_atom_type(props.GetMMFFAtomType(j))
                     ang_idx1.append(i)
                     ang_idx2.append(j)
                     ang_idx3.append(k)
@@ -215,24 +227,16 @@ def extract_mmff_params(
         atom_j = mol.GetAtomWithIdx(j)
         if atom_j.GetDegree() < 2:
             continue
-        # Skip linear atoms (no stretch-bend for linear)
-        theta0_check = angle_theta0_dict.get(
-            tuple(
-                sorted(
-                    [n.GetIdx() for n in atom_j.GetNeighbors()][:2],
-                )
-                + [j]
-            )
-        )
+        is_linear_center = _is_mmff_linear_atom_type(props.GetMMFFAtomType(j))
         neighbors = [n.GetIdx() for n in atom_j.GetNeighbors()]
         for ni in range(len(neighbors)):
             for nk in range(ni + 1, len(neighbors)):
                 i = neighbors[ni]
                 k = neighbors[nk]
-                # Check if this angle's theta0 indicates linearity
-                theta0_val = angle_theta0_dict.get((i, j, k))
-                if theta0_val is not None and theta0_val >= 175.0:
+                # RDKit skips stretch-bend terms for MMFF linear central atoms.
+                if is_linear_center:
                     continue
+                theta0_val = angle_theta0_dict.get((i, j, k))
                 res = props.GetMMFFStretchBendParams(mol, i, j, k)
                 if res is not None and res:
                     # res format varies; try to extract kba values
@@ -354,6 +358,14 @@ def extract_mmff_params(
     diel_const = 1.0
     diel_model = 1
 
+    frag_mapping: np.ndarray | None = None
+    if ignoreInterfragInteractions:
+        frags = Chem.GetMolFrags(mol)
+        if len(frags) > 1:
+            frag_mapping = np.empty(num_atoms, dtype=np.int32)
+            for frag_idx, frag in enumerate(frags):
+                frag_mapping[list(frag)] = frag_idx
+
     # Get conformer for distance filtering
     conf = mol.GetConformer(conf_id) if mol.GetNumConformers() > 0 else None
 
@@ -362,6 +374,9 @@ def extract_mmff_params(
 
     for i in range(num_atoms):
         for j in range(i + 1, num_atoms):
+            if frag_mapping is not None and frag_mapping[i] != frag_mapping[j]:
+                continue
+
             graph_dist = int(dist_matrix[i, j])
             if graph_dist < 3:
                 # 1,2 or 1,3 relationship — skip
@@ -379,10 +394,18 @@ def extract_mmff_params(
             # VdW terms
             vdw_res = props.GetMMFFVdWParams(i, j)
             if vdw_res is not None and vdw_res:
+                # RDKit returns (R_ij_starUnscaled, epsilonUnscaled, R_ij_star, epsilon).
+                # Use the final scaled MMFF values when present.
+                if hasattr(vdw_res, "__len__") and len(vdw_res) >= 4:
+                    r_star_val = float(vdw_res[2])
+                    epsilon_val = float(vdw_res[3])
+                else:
+                    r_star_val = float(vdw_res[0])
+                    epsilon_val = float(vdw_res[1])
                 vdw_idx1.append(i)
                 vdw_idx2.append(j)
-                vdw_R_star.append(float(vdw_res[0]))
-                vdw_eps.append(float(vdw_res[1]))
+                vdw_R_star.append(r_star_val)
+                vdw_eps.append(epsilon_val)
 
             # Electrostatic terms
             qi = props.GetMMFFPartialCharge(i)
