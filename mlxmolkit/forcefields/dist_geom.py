@@ -377,7 +377,9 @@ def fourth_dim_grad(
     dE/dw = 2 * weight * w for E = weight * w^2.
 
     Note: nvMolKit's CUDA code uses weight * w (without the factor of 2),
-    but we use the mathematically correct derivative here.
+    but the mathematically correct derivative produces better results for
+    our float32 BFGS optimizer — the consistent gradient gives the Hessian
+    approximation better curvature information for the 4th dimension.
 
     Args:
         pos: Flat positions array, shape (n_atoms * dim,), float32.

@@ -26,7 +26,10 @@ def stage_coordgen(
         box_size_mult: Box size multiplier (default 2.0, so box_size = 10.0).
     """
     box_size = 5.0 * box_size_mult
-    rng = np.random.default_rng(seed)
+
+    # Use persistent RNG from context if available (advances across calls),
+    # otherwise create a fresh one from seed (legacy behavior).
+    rng = ctx.rng if ctx.rng is not None else np.random.default_rng(seed)
 
     n_total = ctx.n_atoms_total * ctx.dim
     rand_coords = (rng.random(n_total).astype(np.float32) - 0.5) * box_size

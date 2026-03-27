@@ -20,17 +20,17 @@ from typing import Callable
 import mlx.core as mx
 
 # ---------------------
-# Constants (float32-adjusted from nvMolKit)
+# Constants (float32-adjusted, while preserving RDKit scaling/convergence form)
 # ---------------------
-TOLX = 1.2e-6       # Position change convergence (nvMolKit: 1.2e-7, 10x for float32)
-FUNCTOL = 1e-4       # Sufficient decrease (Armijo) — same as nvMolKit
-MOVETOL = 1e-6       # Minimum lambda for line search (nvMolKit: 1e-7, 10x for float32)
-EPS = 3e-7           # Hessian update guard (nvMolKit: 3e-8, 10x for float32)
+TOLX = 1.2e-6
+FUNCTOL = 1e-4
+MOVETOL = 1e-6
+EPS = 3e-7
 MAX_STEP_FACTOR = 100.0
 MAX_LINESEARCH_ITERS = 1000
 GRAD_SCALE_INIT = 0.1
 GRAD_CAP = 10.0
-DEFAULT_GRAD_TOL = 1e-3  # nvMolKit: 1e-4, loosened for float32
+DEFAULT_GRAD_TOL = 1e-3
 
 
 def _scale_grad(
@@ -68,13 +68,13 @@ def _scale_grad(
             scale = grad_scale[mol_idx]
 
         mol_grad = mol_grad * scale
-        max_g = mx.max(mol_grad)
+        max_g = mx.max(mx.abs(mol_grad))
 
         # Halve scale while max gradient > GRAD_CAP
         while max_g.item() > GRAD_CAP:
             scale = scale * 0.5
             mol_grad = grad_r[start:end] * scale
-            max_g = mx.max(mol_grad)
+            max_g = mx.max(mx.abs(mol_grad))
 
         new_grad = new_grad.at[start:end].add(mol_grad - new_grad[start:end])
         grad_scale = grad_scale.at[mol_idx].add(scale - grad_scale[mol_idx])

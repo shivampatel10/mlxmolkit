@@ -13,6 +13,7 @@ from rdkit.Chem import AllChem, rdDistGeom
 from rdkit.Chem.rdDistGeom import EmbedParameters
 
 from mlxmolkit import EmbedMolecules
+from mlxmolkit.pipeline.driver import _RoundRobinRetryScheduler
 
 
 @pytest.fixture
@@ -192,6 +193,31 @@ def test_embed_dg_only():
 
     EmbedMolecules([mol], params, confsPerMolecule=3)
     assert mol.GetNumConformers() > 0
+
+
+def test_retry_scheduler_stops_dispatching_completed_molecules():
+    """Completed molecules should be removed from later retry waves."""
+    scheduler = _RoundRobinRetryScheduler(n_mols=3, confs_per_mol=2, max_iterations=3)
+
+    first_wave = scheduler.dispatch(6)
+    assert first_wave == [0, 0, 1, 1, 2, 2]
+
+    scheduler.record(first_wave, [True, True, False, False, False, False])
+
+    second_wave = scheduler.dispatch(6)
+    assert second_wave == [1, 1, 2, 2]
+
+
+def test_retry_scheduler_respects_max_attempt_limit():
+    """No more work should be dispatched once per-molecule attempts are exhausted."""
+    scheduler = _RoundRobinRetryScheduler(n_mols=2, confs_per_mol=2, max_iterations=1)
+
+    first_wave = scheduler.dispatch(4)
+    assert first_wave == [0, 0, 1, 1]
+
+    scheduler.record(first_wave, [False, False, False, False])
+
+    assert scheduler.dispatch(4) == []
 
 
 # --- ETKDG variant tests against RDKit reference ---

@@ -20,6 +20,7 @@ def EmbedMolecules(
     params: "EmbedParameters",
     confsPerMolecule: int = 1,
     maxIterations: int = -1,
+    batchSize: int = 250,
 ) -> None:
     """Embed multiple molecules with multiple conformers using MLX on Apple Silicon.
 
@@ -38,6 +39,9 @@ def EmbedMolecules(
         confsPerMolecule: Number of conformers to generate per molecule.
         maxIterations: Maximum ETKDG retry iterations, -1 for automatic
             calculation (10 * max_atoms).
+        batchSize: Maximum molecules per GPU batch. Larger batches are
+            more efficient but may hit Metal GPU timeout limits. Default
+            250 (5,000 entries at 20 confs/mol).
 
     Returns:
         None. Input molecules are modified in-place with generated conformers.
@@ -67,10 +71,12 @@ def EmbedMolecules(
     if not params.useRandomCoords:
         raise ValueError("ETKDG requires useRandomCoords=True in EmbedParameters")
 
-    # Run the pipeline
-    embed_molecules_pipeline(
-        molecules,
-        params,
-        confs_per_mol=confsPerMolecule,
-        max_iterations=maxIterations,
-    )
+    # Process in chunks to avoid Metal GPU timeout on large batches
+    for chunk_start in range(0, len(molecules), batchSize):
+        chunk = molecules[chunk_start : chunk_start + batchSize]
+        embed_molecules_pipeline(
+            chunk,
+            params,
+            confs_per_mol=confsPerMolecule,
+            max_iterations=maxIterations,
+        )
