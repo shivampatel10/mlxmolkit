@@ -1,0 +1,679 @@
+
+constant float TOLX = 1.2e-6f;
+constant float FUNCTOL = 1e-4f;
+constant float MOVETOL = 1e-6f;
+constant float EPS_GUARD = 3e-7f;
+constant float MAX_STEP_FACTOR = 100.0f;
+constant int MAX_LS_ITERS = 1000;
+
+// ---- Distance constraint energy (flat-bottom) ----
+inline float dist_constraint_e(
+    const device float* pos, int i1, int i2,
+    float min_len, float max_len, float fc, int dim
+) {
+    float d2 = 0.0f;
+    for (int d = 0; d < 3; d++) {
+        float diff = pos[i1*dim+d] - pos[i2*dim+d];
+        d2 += diff*diff;
+    }
+    float dist = sqrt(max(d2, 1e-16f));
+    float min2 = min_len*min_len;
+    float max2 = max_len*max_len;
+    if (d2 < min2) {
+        float dv = min_len - dist;
+        return 0.5f * fc * dv * dv;
+    } else if (d2 > max2) {
+        float dv = dist - max_len;
+        return 0.5f * fc * dv * dv;
+    }
+    return 0.0f;
+}
+
+// ---- Distance constraint gradient ----
+inline void dist_constraint_g(
+    const device float* pos, device float* grad,
+    int i1, int i2, float min_len, float max_len, float fc, int dim
+) {
+    float diff[3];
+    float d2 = 0.0f;
+    for (int d = 0; d < 3; d++) {
+        diff[d] = pos[i1*dim+d] - pos[i2*dim+d];
+        d2 += diff[d]*diff[d];
+    }
+    float dist = sqrt(max(d2, 1e-16f));
+    float min2 = min_len*min_len, max2 = max_len*max_len;
+    float pf = 0.0f;
+    if (d2 < min2) pf = fc * (dist - min_len) / max(dist, 1e-8f);
+    else if (d2 > max2) pf = fc * (dist - max_len) / max(dist, 1e-8f);
+    if (pf != 0.0f) {
+        for (int d = 0; d < 3; d++) {
+            float g = pf * diff[d];
+            grad[i1*dim+d] += g;
+            grad[i2*dim+d] -= g;
+        }
+    }
+}
+
+// ---- Torsion angle cos(phi) ----
+inline float calc_cos_phi(const device float* pos, int i1, int i2, int i3, int i4, int dim) {
+    float r1[3], r2[3], r3[3], r4[3];
+    for (int d = 0; d < 3; d++) {
+        r1[d] = pos[i1*dim+d] - pos[i2*dim+d];
+        r2[d] = pos[i3*dim+d] - pos[i2*dim+d];
+        r3[d] = -(pos[i3*dim+d] - pos[i2*dim+d]);
+        r4[d] = pos[i4*dim+d] - pos[i3*dim+d];
+    }
+    // t1 = r1 x r2
+    float t1x = r1[1]*r2[2] - r1[2]*r2[1];
+    float t1y = r1[2]*r2[0] - r1[0]*r2[2];
+    float t1z = r1[0]*r2[1] - r1[1]*r2[0];
+    // t2 = r3 x r4
+    float t2x = r3[1]*r4[2] - r3[2]*r4[1];
+    float t2y = r3[2]*r4[0] - r3[0]*r4[2];
+    float t2z = r3[0]*r4[1] - r3[1]*r4[0];
+
+    float t1sq = t1x*t1x + t1y*t1y + t1z*t1z;
+    float t2sq = t2x*t2x + t2y*t2y + t2z*t2z;
+    float comb = t1sq * t2sq;
+    if (comb < 1e-16f) return 0.0f;
+    float dot = t1x*t2x + t1y*t2y + t1z*t2z;
+    float cp = dot * rsqrt(comb);
+    return clamp(cp, -1.0f, 1.0f);
+}
+
+// ---- 6-term Fourier torsion energy ----
+inline float torsion_e(float cos_phi,
+    float fc0, float fc1, float fc2, float fc3, float fc4, float fc5,
+    float s0, float s1, float s2, float s3, float s4, float s5
+) {
+    float c = cos_phi;
+    float c2 = c*c, c3=c*c2, c4=c*c3, c5_v=c*c4, c6=c*c5_v;
+    float cos1=c, cos2=2.0f*c2-1.0f, cos3=4.0f*c3-3.0f*c;
+    float cos4=8.0f*c4-8.0f*c2+1.0f, cos5=16.0f*c5_v-20.0f*c3+5.0f*c;
+    float cos6=32.0f*c6-48.0f*c4+18.0f*c2-1.0f;
+    return fc0*(1.0f+s0*cos1) + fc1*(1.0f+s1*cos2) + fc2*(1.0f+s2*cos3)
+         + fc3*(1.0f+s3*cos4) + fc4*(1.0f+s4*cos5) + fc5*(1.0f+s5*cos6);
+}
+
+// ---- Torsion gradient (full 4-atom) ----
+inline void torsion_g(const device float* pos, device float* grad,
+    int i1, int i2, int i3, int i4,
+    float fc0, float fc1, float fc2, float fc3, float fc4, float fc5,
+    float s0, float s1, float s2, float s3, float s4, float s5,
+    int dim
+) {
+    float r1[3], r2[3], r3[3], r4[3];
+    for (int d=0;d<3;d++) {
+        r1[d] = pos[i1*dim+d] - pos[i2*dim+d];
+        r2[d] = pos[i3*dim+d] - pos[i2*dim+d];
+        r3[d] = -r2[d];
+        r4[d] = pos[i4*dim+d] - pos[i3*dim+d];
+    }
+    float t0x=r1[1]*r2[2]-r1[2]*r2[1], t0y=r1[2]*r2[0]-r1[0]*r2[2], t0z=r1[0]*r2[1]-r1[1]*r2[0];
+    float t1x=r3[1]*r4[2]-r3[2]*r4[1], t1y=r3[2]*r4[0]-r3[0]*r4[2], t1z=r3[0]*r4[1]-r3[1]*r4[0];
+
+    float d02=t0x*t0x+t0y*t0y+t0z*t0z;
+    float d12=t1x*t1x+t1y*t1y+t1z*t1z;
+    if (d02 < 1e-16f || d12 < 1e-16f) return;
+
+    float inv_d0 = rsqrt(max(d02,1e-16f));
+    float inv_d1 = rsqrt(max(d12,1e-16f));
+    float t0nx=t0x*inv_d0, t0ny=t0y*inv_d0, t0nz=t0z*inv_d0;
+    float t1nx=t1x*inv_d1, t1ny=t1y*inv_d1, t1nz=t1z*inv_d1;
+
+    float cos_phi = clamp(t0nx*t1nx+t0ny*t1ny+t0nz*t1nz, -1.0f, 1.0f);
+    float sin_phi_sq = 1.0f - cos_phi*cos_phi;
+    float sin_phi = sqrt(max(sin_phi_sq, 0.0f));
+
+    float c=cos_phi, c2=c*c, c3=c*c2, c4=c*c3;
+    float dE_dPhi =
+        -s0*fc0*sin_phi
+        - 2.0f*s1*fc1*(2.0f*c*sin_phi)
+        - 3.0f*s2*fc2*(4.0f*c2*sin_phi - sin_phi)
+        - 4.0f*s3*fc3*(8.0f*c3*sin_phi - 4.0f*c*sin_phi)
+        - 5.0f*s4*fc4*(16.0f*c4*sin_phi - 12.0f*c2*sin_phi + sin_phi)
+        - 6.0f*s5*fc5*(32.0f*c4*c*sin_phi - 32.0f*c3*sin_phi + 6.0f*sin_phi);
+
+    float sin_term;
+    if (abs(sin_phi) > 1e-8f) {
+        sin_term = -dE_dPhi / sin_phi;
+    } else {
+        float abs_cp = max(abs(cos_phi), 1e-16f);
+        sin_term = -dE_dPhi / abs_cp * sign(cos_phi + 1e-30f);
+    }
+
+    // dCos/dT0, dCos/dT1
+    float dc_t0x = inv_d0*(t1nx - cos_phi*t0nx);
+    float dc_t0y = inv_d0*(t1ny - cos_phi*t0ny);
+    float dc_t0z = inv_d0*(t1nz - cos_phi*t0nz);
+    float dc_t1x = inv_d1*(t0nx - cos_phi*t1nx);
+    float dc_t1y = inv_d1*(t0ny - cos_phi*t1ny);
+    float dc_t1z = inv_d1*(t0nz - cos_phi*t1nz);
+
+    // g1 = sin_term * (dCos_dT0 x r2)
+    float g1x = sin_term * (dc_t0z*r2[1] - dc_t0y*r2[2]);
+    float g1y = sin_term * (dc_t0x*r2[2] - dc_t0z*r2[0]);
+    float g1z = sin_term * (dc_t0y*r2[0] - dc_t0x*r2[1]);
+
+    // g4 = sin_term * (dCos_dT1 x r3) — note cross product order
+    float g4x = sin_term * (dc_t1y*r3[2] - dc_t1z*r3[1]);
+    float g4y = sin_term * (dc_t1z*r3[0] - dc_t1x*r3[2]);
+    float g4z = sin_term * (dc_t1x*r3[1] - dc_t1y*r3[0]);
+
+    // g2: complex
+    float g2x = sin_term * (
+        dc_t0y*(r2[2]-r1[2]) + dc_t0z*(r1[1]-r2[1])
+        + dc_t1y*(-r4[2]) + dc_t1z*r4[1]);
+    float g2y = sin_term * (
+        dc_t0x*(r1[2]-r2[2]) + dc_t0z*(r2[0]-r1[0])
+        + dc_t1x*r4[2] + dc_t1z*(-r4[0]));
+    float g2z = sin_term * (
+        dc_t0x*(r2[1]-r1[1]) + dc_t0y*(r1[0]-r2[0])
+        + dc_t1x*(-r4[1]) + dc_t1y*r4[0]);
+
+    // g3
+    float g3x = sin_term * (
+        dc_t0y*r1[2] + dc_t0z*(-r1[1])
+        + dc_t1y*(r4[2]-r3[2]) + dc_t1z*(r3[1]-r4[1]));
+    float g3y = sin_term * (
+        dc_t0x*(-r1[2]) + dc_t0z*r1[0]
+        + dc_t1x*(r3[2]-r4[2]) + dc_t1z*(r4[0]-r3[0]));
+    float g3z = sin_term * (
+        dc_t0x*r1[1] + dc_t0y*(-r1[0])
+        + dc_t1x*(r4[1]-r3[1]) + dc_t1y*(r3[0]-r4[0]));
+
+    grad[i1*dim+0] += g1x; grad[i1*dim+1] += g1y; grad[i1*dim+2] += g1z;
+    grad[i2*dim+0] += g2x; grad[i2*dim+1] += g2y; grad[i2*dim+2] += g2z;
+    grad[i3*dim+0] += g3x; grad[i3*dim+1] += g3y; grad[i3*dim+2] += g3z;
+    grad[i4*dim+0] += g4x; grad[i4*dim+1] += g4y; grad[i4*dim+2] += g4z;
+}
+
+// ---- Inversion (improper) energy ----
+inline float inversion_e(const device float* pos,
+    int i1, int i2, int i3, int i4,
+    float C0, float C1, float C2, float fc, int dim
+) {
+    float rJI[3], rJK[3], rJL[3];
+    for (int d=0;d<3;d++) {
+        rJI[d] = pos[i1*dim+d] - pos[i2*dim+d];
+        rJK[d] = pos[i3*dim+d] - pos[i2*dim+d];
+        rJL[d] = pos[i4*dim+d] - pos[i2*dim+d];
+    }
+    float l2JI = rJI[0]*rJI[0]+rJI[1]*rJI[1]+rJI[2]*rJI[2];
+    float l2JK = rJK[0]*rJK[0]+rJK[1]*rJK[1]+rJK[2]*rJK[2];
+    float l2JL = rJL[0]*rJL[0]+rJL[1]*rJL[1]+rJL[2]*rJL[2];
+    if (l2JI < 1e-16f || l2JK < 1e-16f || l2JL < 1e-16f) return 0.0f;
+
+    // n = (-rJI) x rJK
+    float nx = (-rJI[1])*rJK[2] - (-rJI[2])*rJK[1];
+    float ny = (-rJI[2])*rJK[0] - (-rJI[0])*rJK[2];
+    float nz = (-rJI[0])*rJK[1] - (-rJI[1])*rJK[0];
+    float nf = rsqrt(max(l2JI*l2JK, 1e-16f));
+    nx *= nf; ny *= nf; nz *= nf;
+    float l2n = nx*nx+ny*ny+nz*nz;
+    if (l2n < 1e-16f) return 0.0f;
+
+    float dot = nx*rJL[0]+ny*rJL[1]+nz*rJL[2];
+    float cos_y = dot * rsqrt(max(l2JL, 1e-16f)) * rsqrt(max(l2n, 1e-16f));
+    cos_y = clamp(cos_y, -1.0f, 1.0f);
+
+    float sin_y_sq = 1.0f - cos_y*cos_y;
+    float sin_y = (sin_y_sq > 0.0f) ? sqrt(sin_y_sq) : 0.0f;
+    float cos_2w = 2.0f*sin_y*sin_y - 1.0f;
+
+    return fc * (C0 + C1*sin_y + C2*cos_2w);
+}
+
+// ---- Inversion gradient ----
+inline void inversion_g(const device float* pos, device float* grad,
+    int i1, int i2, int i3, int i4,
+    float C0, float C1, float C2, float fc, int dim
+) {
+    float rJI[3], rJK[3], rJL[3];
+    for (int d=0;d<3;d++) {
+        rJI[d] = pos[i1*dim+d] - pos[i2*dim+d];
+        rJK[d] = pos[i3*dim+d] - pos[i2*dim+d];
+        rJL[d] = pos[i4*dim+d] - pos[i2*dim+d];
+    }
+    float dJIsq = rJI[0]*rJI[0]+rJI[1]*rJI[1]+rJI[2]*rJI[2];
+    float dJKsq = rJK[0]*rJK[0]+rJK[1]*rJK[1]+rJK[2]*rJK[2];
+    float dJLsq = rJL[0]*rJL[0]+rJL[1]*rJL[1]+rJL[2]*rJL[2];
+    if (dJIsq < 1e-16f || dJKsq < 1e-16f || dJLsq < 1e-16f) return;
+
+    float invdJI = rsqrt(max(dJIsq, 1e-16f));
+    float invdJK = rsqrt(max(dJKsq, 1e-16f));
+    float invdJL = rsqrt(max(dJLsq, 1e-16f));
+
+    float rJIn[3], rJKn[3], rJLn[3];
+    for (int d=0;d<3;d++) {
+        rJIn[d] = rJI[d]*invdJI;
+        rJKn[d] = rJK[d]*invdJK;
+        rJLn[d] = rJL[d]*invdJL;
+    }
+
+    float nx = (-rJIn[1])*rJKn[2] - (-rJIn[2])*rJKn[1];
+    float ny = (-rJIn[2])*rJKn[0] - (-rJIn[0])*rJKn[2];
+    float nz = (-rJIn[0])*rJKn[1] - (-rJIn[1])*rJKn[0];
+    float inv_n_len = rsqrt(max(nx*nx+ny*ny+nz*nz, 1e-16f));
+    float nnx=nx*inv_n_len, nny=ny*inv_n_len, nnz=nz*inv_n_len;
+
+    float cos_y = clamp(nnx*rJLn[0]+nny*rJLn[1]+nnz*rJLn[2], -1.0f, 1.0f);
+    float sin_y = max(sqrt(max(1.0f-cos_y*cos_y, 0.0f)), 1e-8f);
+
+    float cos_theta = clamp(rJIn[0]*rJKn[0]+rJIn[1]*rJKn[1]+rJIn[2]*rJKn[2], -1.0f, 1.0f);
+    float sin_theta = max(sqrt(max(1.0f-cos_theta*cos_theta, 0.0f)), 1e-8f);
+
+    float dE_dW = -fc * (C1*cos_y - 4.0f*C2*cos_y*sin_y);
+
+    float inverseTerm1 = 1.0f / (sin_y * sin_theta);
+    float term2 = cos_y / (sin_y * sin_theta * sin_theta);
+    float cos_y_over_sin_y = cos_y / sin_y;
+
+    // Cross products for gradient
+    // t1 = rJLn x rJKn
+    float t1x=rJLn[1]*rJKn[2]-rJLn[2]*rJKn[1];
+    float t1y=rJLn[2]*rJKn[0]-rJLn[0]*rJKn[2];
+    float t1z=rJLn[0]*rJKn[1]-rJLn[1]*rJKn[0];
+    // t2 = rJIn x rJLn
+    float t2x=rJIn[1]*rJLn[2]-rJIn[2]*rJLn[1];
+    float t2y=rJIn[2]*rJLn[0]-rJIn[0]*rJLn[2];
+    float t2z=rJIn[0]*rJLn[1]-rJIn[1]*rJLn[0];
+    // t3 = rJKn x rJIn
+    float t3x=rJKn[1]*rJIn[2]-rJKn[2]*rJIn[1];
+    float t3y=rJKn[2]*rJIn[0]-rJKn[0]*rJIn[2];
+    float t3z=rJKn[0]*rJIn[1]-rJKn[1]*rJIn[0];
+
+    float tg1[3], tg3[3], tg4[3];
+    tg1[0] = (t1x*inverseTerm1 - (rJIn[0]-rJKn[0]*cos_theta)*term2)*invdJI;
+    tg1[1] = (t1y*inverseTerm1 - (rJIn[1]-rJKn[1]*cos_theta)*term2)*invdJI;
+    tg1[2] = (t1z*inverseTerm1 - (rJIn[2]-rJKn[2]*cos_theta)*term2)*invdJI;
+    tg3[0] = (t2x*inverseTerm1 - (rJKn[0]-rJIn[0]*cos_theta)*term2)*invdJK;
+    tg3[1] = (t2y*inverseTerm1 - (rJKn[1]-rJIn[1]*cos_theta)*term2)*invdJK;
+    tg3[2] = (t2z*inverseTerm1 - (rJKn[2]-rJIn[2]*cos_theta)*term2)*invdJK;
+    tg4[0] = (t3x*inverseTerm1 - rJLn[0]*cos_y_over_sin_y)*invdJL;
+    tg4[1] = (t3y*inverseTerm1 - rJLn[1]*cos_y_over_sin_y)*invdJL;
+    tg4[2] = (t3z*inverseTerm1 - rJLn[2]*cos_y_over_sin_y)*invdJL;
+
+    for (int d=0;d<3;d++) {
+        float g1 = dE_dW * tg1[d];
+        float g3 = dE_dW * tg3[d];
+        float g4 = dE_dW * tg4[d];
+        float g2 = -(g1+g3+g4);
+        grad[i1*dim+d] += g1;
+        grad[i2*dim+d] += g2;
+        grad[i3*dim+d] += g3;
+        grad[i4*dim+d] += g4;
+    }
+}
+
+// ---- Angle constraint energy ----
+inline float angle_e(const device float* pos,
+    int i1, int i2, int i3, float min_ang, float max_ang, float fc, int dim
+) {
+    float r1[3], r2[3];
+    for (int d=0;d<3;d++) {
+        r1[d] = pos[i1*dim+d] - pos[i2*dim+d];
+        r2[d] = pos[i3*dim+d] - pos[i2*dim+d];
+    }
+    float d1sq=r1[0]*r1[0]+r1[1]*r1[1]+r1[2]*r1[2];
+    float d2sq=r2[0]*r2[0]+r2[1]*r2[1]+r2[2]*r2[2];
+    float dt = d1sq*d2sq;
+    if (dt < 1e-16f) return 0.0f;
+    float dot = r1[0]*r2[0]+r1[1]*r2[1]+r1[2]*r2[2];
+    float cos_t = clamp(dot*rsqrt(dt), -1.0f, 1.0f);
+    float angle_deg = 57.29577951f * acos(cos_t); // RAD2DEG
+    float at = 0.0f;
+    if (angle_deg < min_ang) at = angle_deg - min_ang;
+    else if (angle_deg > max_ang) at = angle_deg - max_ang;
+    return fc * at * at;
+}
+
+// ---- Angle constraint gradient ----
+inline void angle_g(const device float* pos, device float* grad,
+    int i1, int i2, int i3, float min_ang, float max_ang, float fc, int dim
+) {
+    float r1[3], r2[3];
+    for (int d=0;d<3;d++) {
+        r1[d] = pos[i1*dim+d] - pos[i2*dim+d];
+        r2[d] = pos[i3*dim+d] - pos[i2*dim+d];
+    }
+    float r1sq=max(r1[0]*r1[0]+r1[1]*r1[1]+r1[2]*r1[2], 1e-5f);
+    float r2sq=max(r2[0]*r2[0]+r2[1]*r2[1]+r2[2]*r2[2], 1e-5f);
+    float denom=rsqrt(r1sq*r2sq);
+    float dot=r1[0]*r2[0]+r1[1]*r2[1]+r1[2]*r2[2];
+    float cos_t=clamp(dot*denom, -1.0f, 1.0f);
+    float angle_deg = 57.29577951f * acos(cos_t);
+    float at = 0.0f;
+    if (angle_deg < min_ang) at = angle_deg - min_ang;
+    else if (angle_deg > max_ang) at = angle_deg - max_ang;
+    if (at == 0.0f) return;
+
+    float dE_dTheta = 2.0f * 57.29577951f * fc * at;
+
+    // rp = r2 x r1
+    float rpx=r2[1]*r1[2]-r2[2]*r1[1], rpy=r2[2]*r1[0]-r2[0]*r1[2], rpz=r2[0]*r1[1]-r2[1]*r1[0];
+    float rpsq = max(rpx*rpx+rpy*rpy+rpz*rpz, 1e-10f);
+    float rpinv = rsqrt(rpsq);
+    float pf = dE_dTheta * rpinv;
+    float t1 = -pf / r1sq;
+    float t2 = pf / r2sq;
+
+    // dedp1 = t1 * (r1 x rp)
+    float dp1x = t1*(r1[1]*rpz-r1[2]*rpy);
+    float dp1y = t1*(r1[2]*rpx-r1[0]*rpz);
+    float dp1z = t1*(r1[0]*rpy-r1[1]*rpx);
+    float dp3x = t2*(r2[1]*rpz-r2[2]*rpy);
+    float dp3y = t2*(r2[2]*rpx-r2[0]*rpz);
+    float dp3z = t2*(r2[0]*rpy-r2[1]*rpx);
+
+    grad[i1*dim+0]+=dp1x; grad[i1*dim+1]+=dp1y; grad[i1*dim+2]+=dp1z;
+    grad[i3*dim+0]+=dp3x; grad[i3*dim+1]+=dp3y; grad[i3*dim+2]+=dp3z;
+    grad[i2*dim+0]+=-(dp1x+dp3x); grad[i2*dim+1]+=-(dp1y+dp3y); grad[i2*dim+2]+=-(dp1z+dp3z);
+}
+// ---- ETK_BFGS_SPLIT ----
+    uint mol_idx = thread_position_in_grid.x;
+
+    int n_mols_cfg = (int)config[0];
+    int max_iters = (int)config[1];
+    float grad_tol_v = config[2];
+    int dim = (int)config[3];
+    int use_bk = (int)config[4];
+
+    if ((int)mol_idx >= n_mols_cfg) return;
+
+    int atom_start = atom_starts[mol_idx];
+    int atom_end = atom_starts[mol_idx + 1];
+    int n_atoms = atom_end - atom_start;
+    int n_terms = n_atoms * dim;
+    int hess_start = hessian_starts[mol_idx];
+
+    // Term boundaries
+    int tor_s = torsion_starts[mol_idx], tor_e = torsion_starts[mol_idx+1];
+    int imp_s = improper_starts[mol_idx], imp_e = improper_starts[mol_idx+1];
+    int d12_s = dist12_starts[mol_idx], d12_e = dist12_starts[mol_idx+1];
+    int d13_s = dist13_starts[mol_idx], d13_e = dist13_starts[mol_idx+1];
+    int ang_s = angle_starts[mol_idx], ang_e = angle_starts[mol_idx+1];
+    int lr_s = lr_starts[mol_idx], lr_e = lr_starts[mol_idx+1];
+
+    // Copy initial positions
+    for (int i = 0; i < n_terms; i++) {
+        out_pos[atom_start * dim + i] = pos[atom_start * dim + i];
+    }
+
+    device float* my_pos = &out_pos[atom_start * dim];
+    device float* my_grad = &work_grad[atom_start * dim];
+    device float* my_dir = &work_dir[atom_start * dim];
+    device float* my_old_pos = &work_scratch[atom_start * dim];
+    device float* my_dgrad = &work_scratch[total_pos_size + atom_start * dim];
+    device float* my_hess_dg = &work_scratch[2 * total_pos_size + atom_start * dim];
+    device float* my_H = &work_hessian[hess_start];
+
+    // Init H = I
+    for (int i = 0; i < n_terms; i++)
+        for (int j = 0; j < n_terms; j++)
+            my_H[i*n_terms+j] = (i==j) ? 1.0f : 0.0f;
+
+    // ---- Compute energy + gradient helper (inline macro) ----
+    // We'll use a lambda-like pattern with goto avoidance
+
+    // Helper: compute total energy and gradient at current my_pos
+    // Zero gradient first
+    for (int i=0; i<n_terms; i++) my_grad[i] = 0.0f;
+    float energy = 0.0f;
+
+    // Torsion
+    for (int t=tor_s; t<tor_e; t++) {
+        int i1=torsion_quads[t*4], i2=torsion_quads[t*4+1], i3=torsion_quads[t*4+2], i4=torsion_quads[t*4+3];
+        float cp = calc_cos_phi(out_pos, i1, i2, i3, i4, dim);
+        energy += torsion_e(cp,
+            torsion_fc[t*6], torsion_fc[t*6+1], torsion_fc[t*6+2],
+            torsion_fc[t*6+3], torsion_fc[t*6+4], torsion_fc[t*6+5],
+            torsion_signs_arr[t*6], torsion_signs_arr[t*6+1], torsion_signs_arr[t*6+2],
+            torsion_signs_arr[t*6+3], torsion_signs_arr[t*6+4], torsion_signs_arr[t*6+5]);
+        torsion_g(out_pos, work_grad, i1, i2, i3, i4,
+            torsion_fc[t*6], torsion_fc[t*6+1], torsion_fc[t*6+2],
+            torsion_fc[t*6+3], torsion_fc[t*6+4], torsion_fc[t*6+5],
+            torsion_signs_arr[t*6], torsion_signs_arr[t*6+1], torsion_signs_arr[t*6+2],
+            torsion_signs_arr[t*6+3], torsion_signs_arr[t*6+4], torsion_signs_arr[t*6+5], dim);
+    }
+    // Improper
+    if (use_bk) {
+        for (int t=imp_s; t<imp_e; t++) {
+            int i1=improper_quads[t*4], i2=improper_quads[t*4+1], i3=improper_quads[t*4+2], i4=improper_quads[t*4+3];
+            energy += inversion_e(out_pos, i1,i2,i3,i4,
+                improper_coeffs[t*4], improper_coeffs[t*4+1], improper_coeffs[t*4+2], improper_coeffs[t*4+3], dim);
+            inversion_g(out_pos, work_grad, i1,i2,i3,i4,
+                improper_coeffs[t*4], improper_coeffs[t*4+1], improper_coeffs[t*4+2], improper_coeffs[t*4+3], dim);
+        }
+    }
+    // Dist12
+    for (int t=d12_s; t<d12_e; t++) {
+        energy += dist_constraint_e(out_pos, dist12_pairs[t*2], dist12_pairs[t*2+1],
+            dist12_bounds[t*3], dist12_bounds[t*3+1], dist12_bounds[t*3+2], dim);
+        dist_constraint_g(out_pos, work_grad, dist12_pairs[t*2], dist12_pairs[t*2+1],
+            dist12_bounds[t*3], dist12_bounds[t*3+1], dist12_bounds[t*3+2], dim);
+    }
+    // Dist13
+    for (int t=d13_s; t<d13_e; t++) {
+        energy += dist_constraint_e(out_pos, dist13_pairs[t*2], dist13_pairs[t*2+1],
+            dist13_bounds[t*3], dist13_bounds[t*3+1], dist13_bounds[t*3+2], dim);
+        dist_constraint_g(out_pos, work_grad, dist13_pairs[t*2], dist13_pairs[t*2+1],
+            dist13_bounds[t*3], dist13_bounds[t*3+1], dist13_bounds[t*3+2], dim);
+    }
+    // Angle
+    for (int t=ang_s; t<ang_e; t++) {
+        energy += angle_e(out_pos, angle_triples[t*3], angle_triples[t*3+1], angle_triples[t*3+2],
+            angle_bounds[t*3], angle_bounds[t*3+1], angle_bounds[t*3+2], dim);
+        angle_g(out_pos, work_grad, angle_triples[t*3], angle_triples[t*3+1], angle_triples[t*3+2],
+            angle_bounds[t*3], angle_bounds[t*3+1], angle_bounds[t*3+2], dim);
+    }
+    // Long-range
+    for (int t=lr_s; t<lr_e; t++) {
+        energy += dist_constraint_e(out_pos, lr_pairs[t*2], lr_pairs[t*2+1],
+            lr_bounds[t*3], lr_bounds[t*3+1], lr_bounds[t*3+2], dim);
+        dist_constraint_g(out_pos, work_grad, lr_pairs[t*2], lr_pairs[t*2+1],
+            lr_bounds[t*3], lr_bounds[t*3+1], lr_bounds[t*3+2], dim);
+    }
+
+    // Initial direction = -grad
+    for (int i=0; i<n_terms; i++) my_dir[i] = -my_grad[i];
+
+    float sum_sq = 0.0f;
+    for (int i=0; i<n_terms; i++) sum_sq += my_pos[i]*my_pos[i];
+    float max_step = MAX_STEP_FACTOR * max(sqrt(sum_sq), (float)n_terms);
+
+    int status = 1;
+
+    // ---- Main BFGS loop ----
+    for (int iter=0; iter < max_iters && status == 1; iter++) {
+        for (int i=0; i<n_terms; i++) my_old_pos[i] = my_pos[i];
+        float old_energy = energy;
+
+        float dir_norm_sq = 0.0f;
+        for (int i=0; i<n_terms; i++) dir_norm_sq += my_dir[i]*my_dir[i];
+        float dir_norm = sqrt(dir_norm_sq);
+        if (dir_norm > max_step) {
+            float s = max_step / dir_norm;
+            for (int i=0; i<n_terms; i++) my_dir[i] *= s;
+        }
+
+        float slope = 0.0f;
+        for (int i=0; i<n_terms; i++) slope += my_dir[i]*my_grad[i];
+
+        float test_max = 0.0f;
+        for (int i=0; i<n_terms; i++) {
+            float t = abs(my_dir[i]) / max(abs(my_pos[i]), 1.0f);
+            if (t > test_max) test_max = t;
+        }
+        float lambda_min_v = MOVETOL / max(test_max, 1e-30f);
+
+        float lam = 1.0f, prev_lam = 1.0f, prev_e = old_energy;
+        bool ls_done = false;
+
+        for (int ls_iter=0; ls_iter < MAX_LS_ITERS && !ls_done; ls_iter++) {
+            if (lam < lambda_min_v) {
+                for (int i=0; i<n_terms; i++) my_pos[i] = my_old_pos[i];
+                ls_done = true; break;
+            }
+            for (int i=0; i<n_terms; i++) my_pos[i] = my_old_pos[i] + lam*my_dir[i];
+
+            float trial_e = 0.0f;
+            for (int t=tor_s; t<tor_e; t++) {
+                float cp = calc_cos_phi(out_pos, torsion_quads[t*4], torsion_quads[t*4+1], torsion_quads[t*4+2], torsion_quads[t*4+3], dim);
+                trial_e += torsion_e(cp, torsion_fc[t*6], torsion_fc[t*6+1], torsion_fc[t*6+2],
+                    torsion_fc[t*6+3], torsion_fc[t*6+4], torsion_fc[t*6+5],
+                    torsion_signs_arr[t*6], torsion_signs_arr[t*6+1], torsion_signs_arr[t*6+2],
+                    torsion_signs_arr[t*6+3], torsion_signs_arr[t*6+4], torsion_signs_arr[t*6+5]);
+            }
+            if (use_bk) {
+                for (int t=imp_s; t<imp_e; t++)
+                    trial_e += inversion_e(out_pos, improper_quads[t*4], improper_quads[t*4+1],
+                        improper_quads[t*4+2], improper_quads[t*4+3],
+                        improper_coeffs[t*4], improper_coeffs[t*4+1], improper_coeffs[t*4+2], improper_coeffs[t*4+3], dim);
+            }
+            for (int t=d12_s; t<d12_e; t++)
+                trial_e += dist_constraint_e(out_pos, dist12_pairs[t*2], dist12_pairs[t*2+1],
+                    dist12_bounds[t*3], dist12_bounds[t*3+1], dist12_bounds[t*3+2], dim);
+            for (int t=d13_s; t<d13_e; t++)
+                trial_e += dist_constraint_e(out_pos, dist13_pairs[t*2], dist13_pairs[t*2+1],
+                    dist13_bounds[t*3], dist13_bounds[t*3+1], dist13_bounds[t*3+2], dim);
+            for (int t=ang_s; t<ang_e; t++)
+                trial_e += angle_e(out_pos, angle_triples[t*3], angle_triples[t*3+1], angle_triples[t*3+2],
+                    angle_bounds[t*3], angle_bounds[t*3+1], angle_bounds[t*3+2], dim);
+            for (int t=lr_s; t<lr_e; t++)
+                trial_e += dist_constraint_e(out_pos, lr_pairs[t*2], lr_pairs[t*2+1],
+                    lr_bounds[t*3], lr_bounds[t*3+1], lr_bounds[t*3+2], dim);
+
+            if (trial_e - old_energy <= FUNCTOL * lam * slope) {
+                energy = trial_e; ls_done = true;
+            } else {
+                float tmp_lam;
+                if (ls_iter == 0) {
+                    tmp_lam = -slope / (2.0f * (trial_e - old_energy - slope));
+                } else {
+                    float rhs1 = trial_e - old_energy - lam*slope;
+                    float rhs2 = prev_e - old_energy - prev_lam*slope;
+                    float lam_sq=lam*lam, lam2_sq=prev_lam*prev_lam;
+                    float dv = lam - prev_lam;
+                    if (abs(dv) < 1e-30f) { tmp_lam = 0.5f*lam; }
+                    else {
+                        float a = (rhs1/lam_sq - rhs2/lam2_sq)/dv;
+                        float b = (-prev_lam*rhs1/lam_sq + lam*rhs2/lam2_sq)/dv;
+                        if (abs(a) < 1e-30f) tmp_lam = (abs(b)>1e-30f) ? -slope/(2.0f*b) : 0.5f*lam;
+                        else {
+                            float disc = b*b - 3.0f*a*slope;
+                            if (disc<0.0f) tmp_lam = 0.5f*lam;
+                            else if (b<=0.0f) tmp_lam = (-b+sqrt(disc))/(3.0f*a);
+                            else tmp_lam = -slope/(b+sqrt(disc));
+                        }
+                    }
+                }
+                tmp_lam = min(tmp_lam, 0.5f*lam);
+                tmp_lam = max(tmp_lam, 0.1f*lam);
+                prev_lam = lam; prev_e = trial_e; lam = tmp_lam;
+            }
+        }
+        if (!ls_done) for (int i=0; i<n_terms; i++) my_pos[i] = my_old_pos[i];
+
+        for (int i=0; i<n_terms; i++) my_old_pos[i] = my_pos[i] - my_old_pos[i]; // xi
+
+        float tolx_test = 0.0f;
+        for (int i=0; i<n_terms; i++) {
+            float t = abs(my_old_pos[i]) / max(abs(my_pos[i]), 1.0f);
+            if (t > tolx_test) tolx_test = t;
+        }
+        if (tolx_test < TOLX) { status = 0; break; }
+
+        for (int i=0; i<n_terms; i++) { my_dgrad[i] = my_grad[i]; my_grad[i] = 0.0f; }
+        energy = 0.0f;
+
+        for (int t=tor_s; t<tor_e; t++) {
+            int i1=torsion_quads[t*4], i2=torsion_quads[t*4+1], i3=torsion_quads[t*4+2], i4=torsion_quads[t*4+3];
+            float cp = calc_cos_phi(out_pos, i1,i2,i3,i4, dim);
+            energy += torsion_e(cp, torsion_fc[t*6], torsion_fc[t*6+1], torsion_fc[t*6+2],
+                torsion_fc[t*6+3], torsion_fc[t*6+4], torsion_fc[t*6+5],
+                torsion_signs_arr[t*6], torsion_signs_arr[t*6+1], torsion_signs_arr[t*6+2],
+                torsion_signs_arr[t*6+3], torsion_signs_arr[t*6+4], torsion_signs_arr[t*6+5]);
+            torsion_g(out_pos, work_grad, i1,i2,i3,i4,
+                torsion_fc[t*6], torsion_fc[t*6+1], torsion_fc[t*6+2],
+                torsion_fc[t*6+3], torsion_fc[t*6+4], torsion_fc[t*6+5],
+                torsion_signs_arr[t*6], torsion_signs_arr[t*6+1], torsion_signs_arr[t*6+2],
+                torsion_signs_arr[t*6+3], torsion_signs_arr[t*6+4], torsion_signs_arr[t*6+5], dim);
+        }
+        if (use_bk) {
+            for (int t=imp_s; t<imp_e; t++) {
+                int i1=improper_quads[t*4], i2=improper_quads[t*4+1], i3=improper_quads[t*4+2], i4=improper_quads[t*4+3];
+                energy += inversion_e(out_pos, i1,i2,i3,i4,
+                    improper_coeffs[t*4], improper_coeffs[t*4+1], improper_coeffs[t*4+2], improper_coeffs[t*4+3], dim);
+                inversion_g(out_pos, work_grad, i1,i2,i3,i4,
+                    improper_coeffs[t*4], improper_coeffs[t*4+1], improper_coeffs[t*4+2], improper_coeffs[t*4+3], dim);
+            }
+        }
+        for (int t=d12_s; t<d12_e; t++) {
+            energy += dist_constraint_e(out_pos, dist12_pairs[t*2], dist12_pairs[t*2+1],
+                dist12_bounds[t*3], dist12_bounds[t*3+1], dist12_bounds[t*3+2], dim);
+            dist_constraint_g(out_pos, work_grad, dist12_pairs[t*2], dist12_pairs[t*2+1],
+                dist12_bounds[t*3], dist12_bounds[t*3+1], dist12_bounds[t*3+2], dim);
+        }
+        for (int t=d13_s; t<d13_e; t++) {
+            energy += dist_constraint_e(out_pos, dist13_pairs[t*2], dist13_pairs[t*2+1],
+                dist13_bounds[t*3], dist13_bounds[t*3+1], dist13_bounds[t*3+2], dim);
+            dist_constraint_g(out_pos, work_grad, dist13_pairs[t*2], dist13_pairs[t*2+1],
+                dist13_bounds[t*3], dist13_bounds[t*3+1], dist13_bounds[t*3+2], dim);
+        }
+        for (int t=ang_s; t<ang_e; t++) {
+            energy += angle_e(out_pos, angle_triples[t*3], angle_triples[t*3+1], angle_triples[t*3+2],
+                angle_bounds[t*3], angle_bounds[t*3+1], angle_bounds[t*3+2], dim);
+            angle_g(out_pos, work_grad, angle_triples[t*3], angle_triples[t*3+1], angle_triples[t*3+2],
+                angle_bounds[t*3], angle_bounds[t*3+1], angle_bounds[t*3+2], dim);
+        }
+        for (int t=lr_s; t<lr_e; t++) {
+            energy += dist_constraint_e(out_pos, lr_pairs[t*2], lr_pairs[t*2+1],
+                lr_bounds[t*3], lr_bounds[t*3+1], lr_bounds[t*3+2], dim);
+            dist_constraint_g(out_pos, work_grad, lr_pairs[t*2], lr_pairs[t*2+1],
+                lr_bounds[t*3], lr_bounds[t*3+1], lr_bounds[t*3+2], dim);
+        }
+
+        for (int i=0; i<n_terms; i++) my_dgrad[i] = my_grad[i] - my_dgrad[i];
+
+        float grad_test = 0.0f;
+        for (int i=0; i<n_terms; i++) {
+            float t = abs(my_grad[i]) * max(abs(my_pos[i]), 1.0f);
+            if (t > grad_test) grad_test = t;
+        }
+        if (grad_test / max(energy, 1.0f) < grad_tol_v) { status = 0; break; }
+
+        // Hessian update
+        for (int i=0; i<n_terms; i++) {
+            float sum = 0.0f;
+            for (int j=0; j<n_terms; j++) sum += my_H[i*n_terms+j]*my_dgrad[j];
+            my_hess_dg[i] = sum;
+        }
+        float fac=0,fae=0,sum_dg=0,sum_xi=0;
+        for (int i=0; i<n_terms; i++) {
+            fac += my_dgrad[i]*my_old_pos[i];
+            fae += my_dgrad[i]*my_hess_dg[i];
+            sum_dg += my_dgrad[i]*my_dgrad[i];
+            sum_xi += my_old_pos[i]*my_old_pos[i];
+        }
+        if (fac*fac > EPS_GUARD*sum_dg*sum_xi && fac > 0.0f) {
+            float fi = 1.0f/fac, fei = 1.0f/fae;
+            for (int i=0; i<n_terms; i++) {
+                for (int j=0; j<n_terms; j++) {
+                    float xi_i=my_old_pos[i], xi_j=my_old_pos[j];
+                    float hd_i=my_hess_dg[i], hd_j=my_hess_dg[j];
+                    float aux_i=fi*xi_i-fei*hd_i, aux_j=fi*xi_j-fei*hd_j;
+                    my_H[i*n_terms+j] += fi*xi_i*xi_j - fei*hd_i*hd_j + fae*aux_i*aux_j;
+                }
+            }
+        }
+
+        for (int i=0; i<n_terms; i++) {
+            float sum = 0.0f;
+            for (int j=0; j<n_terms; j++) sum += my_H[i*n_terms+j]*my_grad[j];
+            my_dir[i] = -sum;
+        }
+    }
+
+    out_energies[mol_idx] = energy;
+    out_statuses[mol_idx] = status;
