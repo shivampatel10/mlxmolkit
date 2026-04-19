@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from rdkit import Chem
 
+import mlxmolkit.pipeline.driver as driver
 from mlxmolkit.pipeline.context import create_pipeline_context
 from mlxmolkit.pipeline.driver import run_dg_pipeline
 from mlxmolkit.pipeline.stage_coordgen import stage_coordgen
@@ -47,17 +48,22 @@ class TestCreatePipelineContext:
         assert ctx.atom_starts[1] == ethanol_mol.GetNumAtoms()
         assert ctx.atom_starts[2] == ctx.n_atoms_total
 
-    def test_tetrahedral_data_present(self, ethanol_mol):
-        """Ethanol should have tetrahedral check data."""
+    def test_ethanol_no_tetrahedral_data(self, ethanol_mol):
+        """Acyclic ethanol should have no nvMolKit tetrahedral check data."""
         ctx = create_pipeline_context([ethanol_mol])
-        assert ctx.tet_data is not None
-        # Ethanol has 2 sp3 carbons
-        assert ctx.tet_data.idx0.shape[0] == 2
+        assert ctx.tet_data is None
 
     def test_benzene_no_tetrahedral_data(self, benzene_mol):
         """Benzene should have no tetrahedral check data."""
         ctx = create_pipeline_context([benzene_mol])
         assert ctx.tet_data is None
+
+    def test_chiral_center_data_separate_from_tetrahedral_data(self, chiral_mol):
+        """Explicit chiral centers are batched separately from tet_data."""
+        ctx = create_pipeline_context([chiral_mol])
+        assert ctx.tet_data is None
+        assert ctx.chiral_center_data is not None
+        assert ctx.chiral_center_data.idx0.shape[0] == 1
 
     def test_collect_failures(self, ethanol_mol):
         """collect_failures should deactivate failed molecules."""
@@ -235,3 +241,45 @@ class TestFullPipeline:
             j = bond.GetEndAtomIdx()
             dist = np.linalg.norm(pos_3d[i] - pos_3d[j])
             assert 0.5 < dist < 3.0, f"Bond {i}-{j} distance {dist:.2f} out of range"
+
+    def test_dg_pipeline_stage_order(self, ethanol_mol, monkeypatch):
+        """Tetrahedral check runs before first chiral check and 4D minimization."""
+        ctx = create_pipeline_context([ethanol_mol])
+        calls = []
+
+        def fake_coordgen(ctx, seed=None, box_size_mult=2.0):
+            calls.append("coordgen")
+
+        def fake_minimize(
+            ctx,
+            chiral_weight,
+            fourth_dim_weight,
+            max_iters,
+            check_energy,
+        ):
+            if max_iters == 400:
+                calls.append("first_dg")
+            else:
+                calls.append("fourth_dim")
+
+        def fake_tetrahedral(ctx, tol=0.3):
+            calls.append("tetrahedral")
+            assert tol == 0.3
+
+        def fake_first_chiral(ctx):
+            calls.append("first_chiral")
+
+        monkeypatch.setattr(driver, "stage_coordgen", fake_coordgen)
+        monkeypatch.setattr(driver, "stage_distgeom_minimize", fake_minimize)
+        monkeypatch.setattr(driver, "stage_tetrahedral_check", fake_tetrahedral)
+        monkeypatch.setattr(driver, "stage_first_chiral_check", fake_first_chiral)
+
+        driver.run_dg_pipeline(ctx, enforce_chirality=True, seed=42)
+
+        assert calls == [
+            "coordgen",
+            "first_dg",
+            "tetrahedral",
+            "first_chiral",
+            "fourth_dim",
+        ]
