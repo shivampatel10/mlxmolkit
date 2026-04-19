@@ -5,11 +5,11 @@ Converts RDKit molecular data into numpy arrays suitable for MLX computation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom, rdMolTransforms
+from rdkit.Chem import rdDistGeom
 
 
 @dataclass
@@ -81,112 +81,38 @@ def get_bounds_matrix(mol: Chem.Mol) -> np.ndarray:
     return rdDistGeom.GetMoleculeBoundsMatrix(mol)
 
 
-def _compute_chiral_volume_bounds(
-    bounds_mat: np.ndarray, i1: int, i2: int, i3: int, i4: int
-) -> tuple[float, float]:
-    """Compute lower and upper bounds on chiral volume from distance bounds.
-
-    Uses the Cayley-Menger determinant to compute the range of possible
-    signed volumes for a tetrahedron defined by 4 atoms, given distance bounds.
-
-    The signed volume is V = (p1-p4) . ((p2-p4) x (p3-p4)).
-    288 * V^2 = det(CM) where CM is the Cayley-Menger matrix.
-
-    We try all 2^6 = 64 combinations of lower/upper bounds for the 6 pairwise
-    distances to find the range of V^2, then determine the sign from the
-    chirality.
-
-    Args:
-        bounds_mat: Distance bounds matrix (upper tri = upper, lower tri = lower).
-        i1, i2, i3, i4: Atom indices.
-
-    Returns:
-        (vol_lower, vol_upper) bounds on the signed chiral volume.
-    """
-    # The 6 pairwise distances
-    pairs = [(i1, i2), (i1, i3), (i1, i4), (i2, i3), (i2, i4), (i3, i4)]
-
-    # Get lower and upper distance bounds for each pair
-    d_lower = np.zeros(6)
-    d_upper = np.zeros(6)
-    for k, (a, b) in enumerate(pairs):
-        lo, hi = min(a, b), max(a, b)
-        d_lower[k] = bounds_mat[hi, lo]  # lower triangle = lower bound
-        d_upper[k] = bounds_mat[lo, hi]  # upper triangle = upper bound
-
-    # Try all 2^6 combinations to find min/max of V^2
-    max_vol_sq = -1.0
-    min_vol_sq = float("inf")
-
-    for mask in range(64):
-        # Choose lower or upper bound for each distance
-        d = np.where(
-            np.array([(mask >> k) & 1 for k in range(6)], dtype=bool),
-            d_upper,
-            d_lower,
-        )
-        d_sq = d * d
-
-        # Cayley-Menger determinant (5x5)
-        # Row/col 0 is the homogeneous coordinate
-        cm = np.zeros((5, 5))
-        cm[0, 1:] = 1.0
-        cm[1:, 0] = 1.0
-
-        # d_sq indices: 0=d12, 1=d13, 2=d14, 3=d23, 4=d24, 5=d34
-        cm[1, 2] = cm[2, 1] = d_sq[0]  # d12^2
-        cm[1, 3] = cm[3, 1] = d_sq[1]  # d13^2
-        cm[1, 4] = cm[4, 1] = d_sq[2]  # d14^2
-        cm[2, 3] = cm[3, 2] = d_sq[3]  # d23^2
-        cm[2, 4] = cm[4, 2] = d_sq[4]  # d24^2
-        cm[3, 4] = cm[4, 3] = d_sq[5]  # d34^2
-
-        det_val = np.linalg.det(cm)
-        vol_sq = det_val / 288.0
-
-        if vol_sq > max_vol_sq:
-            max_vol_sq = vol_sq
-        if vol_sq < min_vol_sq:
-            min_vol_sq = vol_sq
-
-    # Convert V^2 bounds to V bounds
-    if max_vol_sq <= 0:
-        return 0.0, 0.0
-
-    max_vol = np.sqrt(max(max_vol_sq, 0.0))
-    if min_vol_sq > 0:
-        min_vol = np.sqrt(min_vol_sq)
-    else:
-        min_vol = 0.0
-
-    # Return full range: volume can be positive or negative
-    return -max_vol, max_vol
+def _is_explicit_tetrahedral_chiral(atom: Chem.Atom) -> bool:
+    """Return True for explicitly assigned tetrahedral CW/CCW atoms."""
+    return atom.GetChiralTag() in (
+        Chem.ChiralType.CHI_TETRAHEDRAL_CW,
+        Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
+    )
 
 
-def _get_chiral_atom_neighbors(
-    mol: Chem.Mol, atom_idx: int
-) -> tuple[int, int, int] | None:
-    """Get the 3 neighbor indices for a tetrahedral chiral center.
+def _get_explicit_chiral_neighbors(mol: Chem.Mol, atom_idx: int) -> list[int] | None:
+    """Return nvMolKit/RDKit-ordered chiral neighbors.
 
-    Returns neighbors in canonical order for consistent volume computation.
-    Returns None if the atom doesn't have exactly 3 heavy/H neighbors suitable
-    for chirality computation.
+    Four-coordinate chiral centers use all four neighbors. Three-coordinate
+    centers use the center atom as the fourth point.
     """
     atom = mol.GetAtomWithIdx(atom_idx)
     neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
 
-    if len(neighbors) < 3:
-        return None
-
-    # Sort neighbors for canonical ordering
-    neighbors.sort()
-
     if len(neighbors) == 3:
-        return (neighbors[0], neighbors[1], neighbors[2])
-    elif len(neighbors) == 4:
-        # For 4-coordinated atoms, use first 3 neighbors
-        return (neighbors[0], neighbors[1], neighbors[2])
+        return [neighbors[0], neighbors[1], neighbors[2], atom_idx]
+    if len(neighbors) == 4:
+        return neighbors
     return None
+
+
+def _explicit_chiral_volume_bounds(
+    chiral_tag: Chem.ChiralType, n_neighbors: int
+) -> tuple[float, float]:
+    """Return fixed nvMolKit/RDKit chiral volume bounds."""
+    min_vol = 2.0 if n_neighbors == 3 else 5.0
+    if chiral_tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW:
+        return -100.0, -min_vol
+    return min_vol, 100.0
 
 
 def extract_dg_params(
@@ -260,39 +186,27 @@ def extract_dg_params(
     vol_lower_list = []
     vol_upper_list = []
 
-    # Find chiral centers using RDKit
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-    chiral_centers = Chem.FindMolChiralCenters(
-        mol, includeUnassigned=True, useLegacyImplementation=False
-    )
 
-    for atom_idx, chirality in chiral_centers:
-        neighbors = _get_chiral_atom_neighbors(mol, atom_idx)
+    for atom in mol.GetAtoms():
+        if not _is_explicit_tetrahedral_chiral(atom):
+            continue
+
+        atom_idx = atom.GetIdx()
+        n_neighbors = atom.GetDegree()
+        neighbors = _get_explicit_chiral_neighbors(mol, atom_idx)
         if neighbors is None:
             continue
 
-        n1, n2, n3 = neighbors
-        # Use the chiral center as idx4 (pivot), neighbors as idx1-3
-        # This matches nvMolKit's convention: V = (p1-p4) · ((p2-p4) × (p3-p4))
-        vol_lower, vol_upper = _compute_chiral_volume_bounds(
-            bounds_mat, n1, n2, n3, atom_idx
+        n1, n2, n3, n4 = neighbors
+        vol_lower, vol_upper = _explicit_chiral_volume_bounds(
+            atom.GetChiralTag(), n_neighbors
         )
-
-        atom = mol.GetAtomWithIdx(atom_idx)
-        chiral_tag = atom.GetChiralTag()
-
-        if chiral_tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW:
-            # CW chirality: volume should be negative
-            vol_upper = min(vol_upper, 0.0)
-        elif chiral_tag == Chem.ChiralType.CHI_TETRAHEDRAL_CCW:
-            # CCW chirality: volume should be positive
-            vol_lower = max(vol_lower, 0.0)
-        # For unspecified chirality, keep full range
 
         chiral_idx1.append(n1)
         chiral_idx2.append(n2)
         chiral_idx3.append(n3)
-        chiral_idx4.append(atom_idx)
+        chiral_idx4.append(n4)
         vol_lower_list.append(vol_lower)
         vol_upper_list.append(vol_upper)
 
@@ -336,15 +250,8 @@ def extract_dg_params(
 def extract_tetrahedral_atoms(mol: Chem.Mol) -> TetrahedralCheckTerms:
     """Extract tetrahedral atoms for geometry validation.
 
-    Identifies carbon and nitrogen atoms with 4 neighbors that should
-    have proper tetrahedral (non-planar) geometry. These are distinct
-    from chiral centers — tetrahedral atoms include ALL sp3 centers,
-    not just those with explicit stereochemistry.
-
-    Also identifies sp3 nitrogen with 3 bonds (+ lone pair) as
-    3-coordinate tetrahedral centers (idx4 == idx0).
-
-    Port of nvMolKit's findChiralSets() tetrahedral carbon extraction.
+    Mirrors nvMolKit's tetrahedralCarbons extraction: non-explicitly-chiral
+    C/N atoms with degree 4 in fused ring systems, excluding 3-membered rings.
 
     Args:
         mol: RDKit molecule with hydrogens added.
@@ -369,34 +276,29 @@ def extract_tetrahedral_atoms(mol: Chem.Mol) -> TetrahedralCheckTerms:
         if atomic_num not in (6, 7):
             continue
 
-        neighbors = sorted([n.GetIdx() for n in atom.GetNeighbors()])
-        degree = len(neighbors)
+        if _is_explicit_tetrahedral_chiral(atom):
+            continue
 
-        if degree == 4:
-            idx0_list.append(atom_idx)
-            idx1_list.append(neighbors[0])
-            idx2_list.append(neighbors[1])
-            idx3_list.append(neighbors[2])
-            idx4_list.append(neighbors[3])
+        neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+        if len(neighbors) != 4:
+            continue
 
-            # Check if in fused small rings (3 or 4-membered)
-            in_fused = False
-            if ring_info.NumAtomRings(atom_idx) > 0:
-                for ring_size in [3, 4]:
-                    if ring_info.IsAtomInRingOfSize(atom_idx, ring_size):
-                        in_fused = True
-                        break
-            fused_list.append(in_fused)
+        if ring_info.NumAtomRings(atom_idx) < 2:
+            continue
 
-        elif degree == 3 and atomic_num == 7:
-            # Nitrogen with 3 bonds + lone pair (3-coordinate tetrahedral)
-            if atom.GetHybridization() == Chem.HybridizationType.SP3:
-                idx0_list.append(atom_idx)
-                idx1_list.append(neighbors[0])
-                idx2_list.append(neighbors[1])
-                idx3_list.append(neighbors[2])
-                idx4_list.append(atom_idx)  # idx4 == idx0 for 3-coord
-                fused_list.append(False)
+        if ring_info.IsAtomInRingOfSize(atom_idx, 3):
+            continue
+
+        idx0_list.append(atom_idx)
+        idx1_list.append(neighbors[0])
+        idx2_list.append(neighbors[1])
+        idx3_list.append(neighbors[2])
+        idx4_list.append(neighbors[3])
+
+        num_small_rings = sum(
+            1 for ring_size in ring_info.AtomRingSizes(atom_idx) if ring_size < 5
+        )
+        fused_list.append(num_small_rings > 1)
 
     if idx0_list:
         return TetrahedralCheckTerms(
@@ -416,3 +318,47 @@ def extract_tetrahedral_atoms(mol: Chem.Mol) -> TetrahedralCheckTerms:
             idx4=np.array([], dtype=np.int32),
             in_fused_small_rings=np.array([], dtype=bool),
         )
+
+
+def extract_chiral_center_terms(mol: Chem.Mol) -> TetrahedralCheckTerms:
+    """Extract explicit CW/CCW chiral centers for final volume checks."""
+    idx0_list = []
+    idx1_list = []
+    idx2_list = []
+    idx3_list = []
+    idx4_list = []
+
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+
+    for atom in mol.GetAtoms():
+        if not _is_explicit_tetrahedral_chiral(atom):
+            continue
+
+        atom_idx = atom.GetIdx()
+        neighbors = _get_explicit_chiral_neighbors(mol, atom_idx)
+        if neighbors is None:
+            continue
+
+        idx0_list.append(atom_idx)
+        idx1_list.append(neighbors[0])
+        idx2_list.append(neighbors[1])
+        idx3_list.append(neighbors[2])
+        idx4_list.append(neighbors[3])
+
+    if idx0_list:
+        return TetrahedralCheckTerms(
+            idx0=np.array(idx0_list, dtype=np.int32),
+            idx1=np.array(idx1_list, dtype=np.int32),
+            idx2=np.array(idx2_list, dtype=np.int32),
+            idx3=np.array(idx3_list, dtype=np.int32),
+            idx4=np.array(idx4_list, dtype=np.int32),
+            in_fused_small_rings=np.zeros(len(idx0_list), dtype=bool),
+        )
+    return TetrahedralCheckTerms(
+        idx0=np.array([], dtype=np.int32),
+        idx1=np.array([], dtype=np.int32),
+        idx2=np.array([], dtype=np.int32),
+        idx3=np.array([], dtype=np.int32),
+        idx4=np.array([], dtype=np.int32),
+        in_fused_small_rings=np.array([], dtype=bool),
+    )

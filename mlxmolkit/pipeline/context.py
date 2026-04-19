@@ -4,7 +4,7 @@ Provides the PipelineContext dataclass that holds all mutable state for a
 pipeline iteration, plus a factory function to create it from RDKit molecules.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
@@ -14,7 +14,9 @@ from rdkit.Chem import rdDistGeom
 from ..preprocessing.batching import BatchedDGSystem, batch_dg_params
 from ..preprocessing.etk_batching import BatchedETKSystem, batch_etk_params
 from ..preprocessing.rdkit_extract import (
+    DGParams,
     TetrahedralCheckTerms,
+    extract_chiral_center_terms,
     extract_dg_params,
     extract_tetrahedral_atoms,
     get_bounds_matrix,
@@ -33,6 +35,17 @@ class BatchedTetrahedralData:
     idx4: mx.array  # int32 (n_terms,) — neighbor 4 (or idx0 for 3-coord)
     in_fused_small_rings: mx.array  # bool (n_terms,)
     mol_indices: mx.array  # int32 (n_terms,)
+
+
+@dataclass
+class MoleculePipelineCache:
+    """Pre-extracted per-molecule data reused across retry rounds."""
+
+    bounds_mat: np.ndarray
+    dg_params: DGParams
+    tet_terms: TetrahedralCheckTerms
+    chiral_center_terms: TetrahedralCheckTerms
+    etk_params: object | None = None
 
 
 @dataclass
@@ -60,6 +73,9 @@ class PipelineContext:
 
     # Tetrahedral check data (batched)
     tet_data: BatchedTetrahedralData | None
+
+    # Explicit chiral center check data (batched)
+    chiral_center_data: BatchedTetrahedralData | None = None
 
     # ETK 3D force field data (batched) — created if use ETK stages
     etk_system: BatchedETKSystem | None = None
@@ -248,10 +264,9 @@ def _extract_stereo_bond_data(
 
 
 def _extract_chiral_dist_data(
-    mols: list[Chem.Mol],
+    chiral_center_terms_list: list[TetrahedralCheckTerms],
     bounds_matrices: list[np.ndarray],
     atom_starts: list[int],
-    dg_system: BatchedDGSystem,
 ) -> dict[str, np.ndarray] | None:
     """Extract chiral distance matrix check data.
 
@@ -265,10 +280,9 @@ def _extract_chiral_dist_data(
     which stores center + 4 neighbors.
 
     Args:
-        mols: RDKit molecules.
+        chiral_center_terms_list: Explicit chiral center terms per batch entry.
         bounds_matrices: Per-molecule distance bounds matrices.
         atom_starts: Cumulative atom start indices.
-        dg_system: Batched DG system (unused, kept for API compat).
 
     Returns:
         Dict with 'idx0', 'idx1', 'lower', 'upper', 'mol_indices' arrays,
@@ -278,49 +292,25 @@ def _extract_chiral_dist_data(
     lower_list, upper_list = [], []
     mol_list = []
 
-    # Build a set of CW/CCW chiral center indices per molecule.
-    # nvMolKit's chiralDistMatrixCheck uses only eargs.chiralCenters
-    # (explicitly CW/CCW atoms), not unassigned tetrahedralCenters.
-    mol_cw_ccw = []
-    for mol in mols:
-        cw_ccw = set()
-        for atom in mol.GetAtoms():
-            tag = atom.GetChiralTag()
-            if tag in (Chem.ChiralType.CHI_TETRAHEDRAL_CW,
-                       Chem.ChiralType.CHI_TETRAHEDRAL_CCW):
-                cw_ccw.add(atom.GetIdx())
-        mol_cw_ccw.append(cw_ccw)
-
-    chiral_idx1 = np.array(dg_system.chiral_idx1)
-    chiral_idx2 = np.array(dg_system.chiral_idx2)
-    chiral_idx3 = np.array(dg_system.chiral_idx3)
-    chiral_idx4 = np.array(dg_system.chiral_idx4)
-    chiral_mol = np.array(dg_system.chiral_mol_indices)
-
-    for i, mol in enumerate(mols):
+    for i, terms in enumerate(chiral_center_terms_list):
         offset = atom_starts[i]
         bmat = bounds_matrices[i]
 
-        # Collect atoms from chiral terms that belong to CW/CCW centers
-        chiral_mask = chiral_mol == i
-        if not np.any(chiral_mask):
-            continue
-
-        cw_ccw = mol_cw_ccw[i]
-        if not cw_ccw:
-            continue
-
         chiral_atoms = set()
-        for t in np.where(chiral_mask)[0]:
-            # idx4 is the center atom — only include this term if
-            # the center is a CW/CCW chiral center
-            center_local = int(chiral_idx4[t]) - offset
-            if center_local not in cw_ccw:
+        for t in range(len(terms.idx0)):
+            # nvMolKit skips 3-coordinate chiral centers for this check.
+            if terms.idx0[t] == terms.idx4[t]:
                 continue
-            for idx_arr in [chiral_idx1, chiral_idx2, chiral_idx3, chiral_idx4]:
-                local = int(idx_arr[t]) - offset
-                if 0 <= local < mol.GetNumAtoms():
-                    chiral_atoms.add(local)
+            chiral_atoms.update(
+                int(idx)
+                for idx in (
+                    terms.idx0[t],
+                    terms.idx1[t],
+                    terms.idx2[t],
+                    terms.idx3[t],
+                    terms.idx4[t],
+                )
+            )
 
         if not chiral_atoms:
             continue
@@ -381,6 +371,7 @@ def create_pipeline_context(
     # Extract per-molecule data
     dg_params_list = []
     tet_terms_list = []
+    chiral_center_terms_list = []
     etk_params_list = []
     bounds_matrices = []
 
@@ -391,6 +382,8 @@ def create_pipeline_context(
         dg_params_list.append(dg_params)
         tet_terms = extract_tetrahedral_atoms(mol)
         tet_terms_list.append(tet_terms)
+        chiral_center_terms = extract_chiral_center_terms(mol)
+        chiral_center_terms_list.append(chiral_center_terms)
 
         if use_etk:
             etk = extract_etk_params(mol, bounds_mat, params=params)
@@ -402,6 +395,9 @@ def create_pipeline_context(
     # Batch tetrahedral terms
     atom_starts_np = np.array(dg_system.atom_starts.tolist(), dtype=np.int32)
     tet_data = _batch_tetrahedral_terms(tet_terms_list, atom_starts_np)
+    chiral_center_data = _batch_tetrahedral_terms(
+        chiral_center_terms_list, atom_starts_np
+    )
 
     atom_starts = dg_system.atom_starts.tolist()
     n_atoms_total = dg_system.n_atoms_total
@@ -422,7 +418,7 @@ def create_pipeline_context(
     chiral_dist_data = None
     if enforce_chirality:
         chiral_dist_data = _extract_chiral_dist_data(
-            mols, bounds_matrices, atom_starts, dg_system
+            chiral_center_terms_list, bounds_matrices, atom_starts
         )
 
     return PipelineContext(
@@ -435,6 +431,7 @@ def create_pipeline_context(
         failed=[False] * n_mols,
         dg_system=dg_system,
         tet_data=tet_data,
+        chiral_center_data=chiral_center_data,
         etk_system=etk_system,
         double_bond_data=double_bond_data,
         stereo_bond_data=stereo_bond_data,
@@ -478,6 +475,7 @@ def create_pipeline_context_multi_conf(
     # Extract per-molecule data ONCE
     per_mol_dg = []
     per_mol_tet = []
+    per_mol_chiral_center = []
     per_mol_etk = []
     per_mol_bounds = []
 
@@ -488,6 +486,8 @@ def create_pipeline_context_multi_conf(
         per_mol_dg.append(dg_params)
         tet_terms = extract_tetrahedral_atoms(mol)
         per_mol_tet.append(tet_terms)
+        chiral_center_terms = extract_chiral_center_terms(mol)
+        per_mol_chiral_center.append(chiral_center_terms)
 
         if use_etk:
             etk = extract_etk_params(mol, bounds_mat, params=params)
@@ -496,6 +496,7 @@ def create_pipeline_context_multi_conf(
     # Replicate params for each conformer slot
     dg_params_list = []
     tet_terms_list = []
+    chiral_center_terms_list = []
     etk_params_list = []
     bounds_matrices = []
     entry_mol_map: list[int] = []  # entry_idx -> unique mol index
@@ -506,6 +507,7 @@ def create_pipeline_context_multi_conf(
         for _ in range(n_confs):
             dg_params_list.append(per_mol_dg[mol_idx])
             tet_terms_list.append(per_mol_tet[mol_idx])
+            chiral_center_terms_list.append(per_mol_chiral_center[mol_idx])
             bounds_matrices.append(per_mol_bounds[mol_idx])
             entry_mol_map.append(mol_idx)
             replicated_mols.append(mols[mol_idx])
@@ -519,6 +521,9 @@ def create_pipeline_context_multi_conf(
 
     atom_starts_np = np.array(dg_system.atom_starts.tolist(), dtype=np.int32)
     tet_data = _batch_tetrahedral_terms(tet_terms_list, atom_starts_np)
+    chiral_center_data = _batch_tetrahedral_terms(
+        chiral_center_terms_list, atom_starts_np
+    )
 
     atom_starts = dg_system.atom_starts.tolist()
     n_atoms_total = dg_system.n_atoms_total
@@ -535,7 +540,7 @@ def create_pipeline_context_multi_conf(
     chiral_dist_data = None
     if enforce_chirality:
         chiral_dist_data = _extract_chiral_dist_data(
-            replicated_mols, bounds_matrices, atom_starts, dg_system
+            chiral_center_terms_list, bounds_matrices, atom_starts
         )
 
     return PipelineContext(
@@ -548,6 +553,7 @@ def create_pipeline_context_multi_conf(
         failed=[False] * n_entries,
         dg_system=dg_system,
         tet_data=tet_data,
+        chiral_center_data=chiral_center_data,
         etk_system=etk_system,
         double_bond_data=double_bond_data,
         stereo_bond_data=stereo_bond_data,
@@ -564,25 +570,34 @@ def extract_mol_params_cache(
     basin_size_tol: float = 1e8,
     params: "rdDistGeom.EmbedParameters | None" = None,
     use_etk: bool = False,
-) -> list[tuple]:
+) -> list[MoleculePipelineCache]:
     """Pre-extract per-molecule parameters for caching across retry rounds.
 
-    Returns a list of (bounds_mat, dg_params, tet_terms, etk_params) tuples,
-    one per molecule. etk_params is None if use_etk is False.
+    Returns a list of MoleculePipelineCache entries, one per molecule.
+    etk_params is None if use_etk is False.
     """
     cache = []
     for mol in mols:
         bounds_mat = get_bounds_matrix(mol)
         dg_params = extract_dg_params(mol, bounds_mat, dim, basin_size_tol)
         tet_terms = extract_tetrahedral_atoms(mol)
+        chiral_center_terms = extract_chiral_center_terms(mol)
         etk = extract_etk_params(mol, bounds_mat, params=params) if use_etk else None
-        cache.append((bounds_mat, dg_params, tet_terms, etk))
+        cache.append(
+            MoleculePipelineCache(
+                bounds_mat=bounds_mat,
+                dg_params=dg_params,
+                tet_terms=tet_terms,
+                chiral_center_terms=chiral_center_terms,
+                etk_params=etk,
+            )
+        )
     return cache
 
 
 def create_pipeline_context_from_cache(
     mols: list[Chem.Mol],
-    mol_cache: list[tuple],
+    mol_cache: list[MoleculePipelineCache],
     confs_per_mol: list[int],
     dim: int = 4,
     use_etk: bool = False,
@@ -611,22 +626,24 @@ def create_pipeline_context_from_cache(
     # Replicate cached params for each conformer slot
     dg_params_list = []
     tet_terms_list = []
+    chiral_center_terms_list = []
     etk_params_list = []
     bounds_matrices = []
     entry_mol_map: list[int] = []
     replicated_mols: list[Chem.Mol] = []
 
     for mol_idx in range(n_unique):
-        bounds_mat, dg_params, tet_terms, etk = mol_cache[mol_idx]
+        cached = mol_cache[mol_idx]
         n_confs = confs_per_mol[mol_idx]
         for _ in range(n_confs):
-            dg_params_list.append(dg_params)
-            tet_terms_list.append(tet_terms)
-            bounds_matrices.append(bounds_mat)
+            dg_params_list.append(cached.dg_params)
+            tet_terms_list.append(cached.tet_terms)
+            chiral_center_terms_list.append(cached.chiral_center_terms)
+            bounds_matrices.append(cached.bounds_mat)
             entry_mol_map.append(mol_idx)
             replicated_mols.append(mols[mol_idx])
-            if use_etk and etk is not None:
-                etk_params_list.append(etk)
+            if use_etk and cached.etk_params is not None:
+                etk_params_list.append(cached.etk_params)
 
     n_entries = len(dg_params_list)
 
@@ -635,6 +652,9 @@ def create_pipeline_context_from_cache(
 
     atom_starts_np = np.array(dg_system.atom_starts.tolist(), dtype=np.int32)
     tet_data = _batch_tetrahedral_terms(tet_terms_list, atom_starts_np)
+    chiral_center_data = _batch_tetrahedral_terms(
+        chiral_center_terms_list, atom_starts_np
+    )
 
     atom_starts = dg_system.atom_starts.tolist()
     n_atoms_total = dg_system.n_atoms_total
@@ -651,7 +671,7 @@ def create_pipeline_context_from_cache(
     chiral_dist_data = None
     if enforce_chirality:
         chiral_dist_data = _extract_chiral_dist_data(
-            replicated_mols, bounds_matrices, atom_starts, dg_system
+            chiral_center_terms_list, bounds_matrices, atom_starts
         )
 
     return PipelineContext(
@@ -664,6 +684,7 @@ def create_pipeline_context_from_cache(
         failed=[False] * n_entries,
         dg_system=dg_system,
         tet_data=tet_data,
+        chiral_center_data=chiral_center_data,
         etk_system=etk_system,
         double_bond_data=double_bond_data,
         stereo_bond_data=stereo_bond_data,

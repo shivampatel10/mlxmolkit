@@ -122,7 +122,14 @@ def run_dg_pipeline(
     if ctx.n_active() == 0:
         return
 
-    # Stage 3: First chiral check
+    # Stage 3: Tetrahedral check
+    stage_tetrahedral_check(ctx, tol=0.3)
+    ctx.collect_failures()
+
+    if ctx.n_active() == 0:
+        return
+
+    # Stage 3b: First chiral check
     if enforce_chirality:
         stage_first_chiral_check(ctx)
         ctx.collect_failures()
@@ -142,16 +149,6 @@ def run_dg_pipeline(
 
     if ctx.n_active() == 0:
         return
-
-    # Stage 4b: Tetrahedral check — runs after 4th-dim collapse.
-    # nvMolKit runs this after stage 2 (before DG min 2) with tol=0.3,
-    # but their float64 CUDA minimizer produces geometry where centers
-    # are further from face planes. Our float32 minimizer often places
-    # centers within 0.05-0.25 of a face (all |d2| > 0.05 are valid).
-    # Using tol=0.1 (matching nvMolKit's final chiral volume check)
-    # avoids false rejections while still catching degenerate geometry.
-    stage_tetrahedral_check(ctx, tol=0.1)
-    ctx.collect_failures()
 
 
 def run_full_pipeline(

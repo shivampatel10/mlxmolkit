@@ -480,11 +480,11 @@ def stage_chiral_volume_check(ctx: PipelineContext) -> None:
     Args:
         ctx: Pipeline context (modifies ``ctx.failed`` in place).
     """
-    tet_data = ctx.tet_data
-    if tet_data is None:
+    chiral_center_data = ctx.chiral_center_data
+    if chiral_center_data is None:
         return
 
-    n_terms = tet_data.idx0.shape[0]
+    n_terms = chiral_center_data.idx0.shape[0]
     if n_terms == 0:
         return
 
@@ -494,7 +494,7 @@ def stage_chiral_volume_check(ctx: PipelineContext) -> None:
 
         active = _build_active_array(ctx)
         failed = metal_tetrahedral_check(
-            ctx.positions, tet_data, active,
+            ctx.positions, chiral_center_data, active,
             ctx.n_mols, ctx.dim, tol=0.1, do_volume_test=False,
         )
         _apply_failed(ctx, failed)
@@ -506,12 +506,12 @@ def stage_chiral_volume_check(ctx: PipelineContext) -> None:
     mx.eval(ctx.positions)
     pos = np.array(ctx.positions).reshape(-1, ctx.dim)[:, :3]
 
-    idx0 = np.array(tet_data.idx0)
-    idx1 = np.array(tet_data.idx1)
-    idx2 = np.array(tet_data.idx2)
-    idx3 = np.array(tet_data.idx3)
-    idx4 = np.array(tet_data.idx4)
-    mol_indices = np.array(tet_data.mol_indices)
+    idx0 = np.array(chiral_center_data.idx0)
+    idx1 = np.array(chiral_center_data.idx1)
+    idx2 = np.array(chiral_center_data.idx2)
+    idx3 = np.array(chiral_center_data.idx3)
+    idx4 = np.array(chiral_center_data.idx4)
+    mol_indices = np.array(chiral_center_data.mol_indices)
 
     # nvMolKit uses tol=0.1 for the final chiral volume check (stage 6d),
     # vs tol=0.3 for the earlier tetrahedral check (stage 3).
