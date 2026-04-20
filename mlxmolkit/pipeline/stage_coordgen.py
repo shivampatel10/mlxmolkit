@@ -17,15 +17,18 @@ def stage_coordgen(
 ) -> None:
     """Generate random 4D coordinates for all molecules.
 
-    Each coordinate is sampled uniformly from ``[-box_size/2, box_size/2]``
-    where ``box_size = 5.0 * box_size_mult``.
+    Each coordinate is sampled uniformly from ``[-box_size/2, box_size/2]``.
+    Positive ``box_size_mult`` values scale the default box size, while
+    non-positive values are interpreted as an absolute box size following
+    RDKit/nvMolKit semantics.
 
     Args:
         ctx: Pipeline context (modified in place).
         seed: Random seed for reproducibility.
         box_size_mult: Box size multiplier (default 2.0, so box_size = 10.0).
+            Non-positive values use ``box_size = -box_size_mult``.
     """
-    box_size = 5.0 * box_size_mult
+    box_size = 5.0 * box_size_mult if box_size_mult > 0 else -box_size_mult
 
     # Use persistent RNG from context if available (advances across calls),
     # otherwise create a fresh one from seed (legacy behavior).

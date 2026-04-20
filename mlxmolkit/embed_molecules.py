@@ -10,9 +10,9 @@ if TYPE_CHECKING:
     from rdkit.Chem import Mol
     from rdkit.Chem.rdDistGeom import EmbedParameters
 
-from .pipeline.driver import embed_molecules_pipeline
+from .pipeline.driver import embed_molecules_pipeline, get_last_embed_stats
 
-__all__ = ["EmbedMolecules"]
+__all__ = ["EmbedMolecules", "get_last_embed_stats"]
 
 
 def EmbedMolecules(
@@ -36,6 +36,7 @@ def EmbedMolecules(
             prepared (sanitized, explicit hydrogens added if needed).
         params: RDKit EmbedParameters object with embedding settings.
             Must have useRandomCoords=True for ETKDG.
+            Existing conformers are cleared unless params.clearConfs is false.
         confsPerMolecule: Number of conformers to generate per molecule.
         maxIterations: Maximum ETKDG retry iterations, -1 for automatic
             calculation (10 * max_atoms).
@@ -70,6 +71,10 @@ def EmbedMolecules(
 
     if not params.useRandomCoords:
         raise ValueError("ETKDG requires useRandomCoords=True in EmbedParameters")
+
+    if getattr(params, "clearConfs", True):
+        for mol in molecules:
+            mol.RemoveAllConformers()
 
     # Process in chunks to avoid Metal GPU timeout on large batches
     for chunk_start in range(0, len(molecules), batchSize):
