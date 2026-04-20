@@ -3,6 +3,8 @@
 Orchestrates all 7 stages with retry scheduling for failed conformers.
 """
 
+from dataclasses import dataclass, field
+import time
 import mlx.core as mx
 import numpy as np
 from rdkit import Chem
@@ -28,6 +30,50 @@ from .stage_stereochem_checks import (
 )
 
 
+@dataclass
+class EmbedPassStats:
+    """Timing and count data for one embedding dispatch pass."""
+
+    pass_index: int
+    attempts: int
+    unique_mols: int
+    context_seconds: float
+    pipeline_seconds: float
+    writeback_seconds: float
+    successes: int
+    conformers_written: int
+
+
+@dataclass
+class EmbedPipelineStats:
+    """Retry statistics from the most recent embedding pipeline call."""
+
+    n_mols: int
+    confs_per_mol: int
+    max_iterations: int
+    passes: list[EmbedPassStats] = field(default_factory=list)
+
+    @property
+    def total_attempts(self) -> int:
+        return sum(pass_stats.attempts for pass_stats in self.passes)
+
+    @property
+    def total_successes(self) -> int:
+        return sum(pass_stats.successes for pass_stats in self.passes)
+
+    @property
+    def total_conformers_written(self) -> int:
+        return sum(pass_stats.conformers_written for pass_stats in self.passes)
+
+
+_LAST_EMBED_STATS: EmbedPipelineStats | None = None
+
+
+def get_last_embed_stats() -> EmbedPipelineStats | None:
+    """Return retry statistics from the most recent embedding pipeline call."""
+    return _LAST_EMBED_STATS
+
+
 class _RoundRobinRetryScheduler:
     """Dispatch conformer attempts in round-robin waves.
 
@@ -51,30 +97,61 @@ class _RoundRobinRetryScheduler:
         self.total_attempts = [0] * n_mols
         self.round_robin_iter = 1
 
-    def dispatch(self, batch_size: int) -> list[int]:
+    def _round_is_exhausted(self, max_attempts_this_round: int) -> bool:
+        return all(
+            completed >= self.confs_per_mol or attempts >= max_attempts_this_round
+            for completed, attempts in zip(
+                self.completed_confs,
+                self.total_attempts,
+                strict=True,
+            )
+        )
+
+    def dispatch(
+        self,
+        batch_size: int,
+        min_batch_size: int = 0,
+        lookahead_rounds: int = 1,
+    ) -> list[int]:
         """Return a batch of molecule ids to attempt next."""
         if batch_size <= 0:
             return []
 
         mol_ids: list[int] = []
-        max_attempts_this_round = min(
-            self.max_attempts_per_mol,
-            self.confs_per_mol * self.round_robin_iter,
-        )
-        for mol_idx in range(self.n_mols):
-            while (
-                self.completed_confs[mol_idx] < self.confs_per_mol
-                and self.total_attempts[mol_idx] < max_attempts_this_round
-            ):
+        rounds_dispatched = 0
+        coalesce = min_batch_size > 0 and lookahead_rounds > 1
+
+        while len(mol_ids) < batch_size:
+            before_round = len(mol_ids)
+            max_attempts_this_round = min(
+                self.max_attempts_per_mol,
+                self.confs_per_mol * self.round_robin_iter,
+            )
+            for mol_idx in range(self.n_mols):
+                while (
+                    self.completed_confs[mol_idx] < self.confs_per_mol
+                    and self.total_attempts[mol_idx] < max_attempts_this_round
+                ):
+                    if len(mol_ids) >= batch_size:
+                        break
+                    mol_ids.append(mol_idx)
+                    self.total_attempts[mol_idx] += 1
                 if len(mol_ids) >= batch_size:
                     break
-                mol_ids.append(mol_idx)
-                self.total_attempts[mol_idx] += 1
-            if len(mol_ids) >= batch_size:
-                break
 
-        if self.total_attempts[-1] == max_attempts_this_round:
-            self.round_robin_iter += 1
+            if self._round_is_exhausted(max_attempts_this_round):
+                self.round_robin_iter += 1
+
+            rounds_dispatched += 1
+            made_progress = len(mol_ids) > before_round
+            if not coalesce:
+                break
+            if len(mol_ids) >= min_batch_size:
+                break
+            if rounds_dispatched >= lookahead_rounds:
+                break
+            if not made_progress:
+                break
 
         return mol_ids
 
@@ -86,6 +163,23 @@ class _RoundRobinRetryScheduler:
         for mol_idx, did_complete in zip(mol_ids, completed, strict=True):
             if did_complete:
                 self.completed_confs[mol_idx] += 1
+
+
+def _resolve_max_iterations(
+    mols: list[Chem.Mol],
+    params: rdDistGeom.EmbedParameters,
+    max_iterations: int,
+) -> int:
+    """Resolve retry iterations from explicit arg, params, or auto fallback."""
+    if max_iterations > 0:
+        return max_iterations
+
+    params_max_iterations = getattr(params, "maxIterations", 0)
+    if params_max_iterations > 0:
+        return params_max_iterations
+
+    max_atoms = max(mol.GetNumAtoms() for mol in mols)
+    return 10 * max_atoms
 
 
 def run_dg_pipeline(
@@ -304,17 +398,28 @@ def embed_molecules_pipeline(
         mols: RDKit molecules with hydrogens added.
         params: RDKit EmbedParameters controlling algorithm behavior.
         confs_per_mol: Number of conformers to generate per molecule.
-        max_iterations: Max retry iterations (-1 = 10 * max_atoms).
+        max_iterations: Max retry iterations. Values <= 0 defer to
+            params.maxIterations, then 10 * max_atoms.
     """
+    global _LAST_EMBED_STATS
+
     if not mols:
+        _LAST_EMBED_STATS = EmbedPipelineStats(
+            n_mols=0,
+            confs_per_mol=confs_per_mol,
+            max_iterations=0,
+        )
         return
 
     n_mols = len(mols)
 
-    # Determine max iterations
-    max_atoms = max(mol.GetNumAtoms() for mol in mols)
-    if max_iterations <= 0:
-        max_iterations = 10 * max_atoms
+    max_iterations = _resolve_max_iterations(mols, params, max_iterations)
+    stats = EmbedPipelineStats(
+        n_mols=n_mols,
+        confs_per_mol=confs_per_mol,
+        max_iterations=max_iterations,
+    )
+    _LAST_EMBED_STATS = stats
 
     # Pipeline flags
     use_exp_torsion = params.useExpTorsionAnglePrefs
@@ -332,6 +437,8 @@ def embed_molecules_pipeline(
     confs_written = [0] * n_mols
     scheduler = _RoundRobinRetryScheduler(n_mols, confs_per_mol, max_iterations)
     dispatch_batch_size = n_mols * confs_per_mol
+    retry_min_batch_size = max(confs_per_mol, dispatch_batch_size // 2)
+    retry_lookahead_rounds = 8
 
     # Pre-extract per-molecule params once (expensive RDKit calls).
     # Cached params are reused across all retry rounds.
@@ -341,10 +448,19 @@ def embed_molecules_pipeline(
         use_etk=use_etk,
     )
 
+    pass_index = 0
     while True:
-        mol_ids = scheduler.dispatch(dispatch_batch_size)
+        if pass_index == 0:
+            mol_ids = scheduler.dispatch(dispatch_batch_size)
+        else:
+            mol_ids = scheduler.dispatch(
+                dispatch_batch_size,
+                min_batch_size=retry_min_batch_size,
+                lookahead_rounds=retry_lookahead_rounds,
+            )
         if not mol_ids:
             break
+        pass_index += 1
 
         slots_by_mol = np.bincount(
             np.array(mol_ids, dtype=np.int32),
@@ -361,6 +477,7 @@ def embed_molecules_pipeline(
         ]
 
         # Create multi-conf context from cached params (skips RDKit extraction)
+        t_context = time.perf_counter()
         ctx = create_pipeline_context_from_cache(
             batch_mols,
             mol_cache=batch_cache,
@@ -370,8 +487,10 @@ def embed_molecules_pipeline(
             enforce_chirality=enforce_chirality,
             rng=rng,
         )
+        context_seconds = time.perf_counter() - t_context
 
         # Run full pipeline (RNG advances naturally through coordgen)
+        t_pipeline = time.perf_counter()
         run_full_pipeline(
             ctx,
             enforce_chirality=enforce_chirality,
@@ -381,12 +500,15 @@ def embed_molecules_pipeline(
             seed=None,  # RNG is on context, no seed needed
             box_size_mult=box_size_mult,
         )
+        pipeline_seconds = time.perf_counter() - t_pipeline
 
         # Write back successful conformers, track per-molecule successes
+        t_writeback = time.perf_counter()
         mx.eval(ctx.positions)
         pos_np = np.array(ctx.positions).reshape(-1, ctx.dim)
 
         completed = [False] * ctx.n_mols
+        conformers_written_this_pass = 0
         for entry_idx in range(ctx.n_mols):
             if not ctx.active[entry_idx] or ctx.failed[entry_idx]:
                 continue
@@ -407,8 +529,22 @@ def embed_molecules_pipeline(
             )
             if conf_id >= 0:
                 confs_written[orig_mol_idx] += 1
+                conformers_written_this_pass += 1
 
         scheduler.record(entry_mol_ids, completed)
+        writeback_seconds = time.perf_counter() - t_writeback
+        stats.passes.append(
+            EmbedPassStats(
+                pass_index=pass_index,
+                attempts=len(mol_ids),
+                unique_mols=len(batch_mol_ids),
+                context_seconds=context_seconds,
+                pipeline_seconds=pipeline_seconds,
+                writeback_seconds=writeback_seconds,
+                successes=sum(completed),
+                conformers_written=conformers_written_this_pass,
+            )
+        )
 
         # Early termination: stop if no molecule produced anything
         if not any(completed):

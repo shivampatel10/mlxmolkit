@@ -8,6 +8,8 @@ Dataset: All valid molecules from MMFF94_dative.sdf (~761 mols)
 Conformers: 20 per molecule
 """
 
+import argparse
+import dataclasses
 import multiprocessing as mp
 import os
 import time
@@ -68,8 +70,66 @@ def bench_rdkit_cpu(mols):
 # ---------------------------------------------------------------------------
 # mlxmolkit GPU
 # ---------------------------------------------------------------------------
-def bench_mlx_gpu(mols):
-    from mlxmolkit.embed_molecules import EmbedMolecules
+def _stats_value(obj, name, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _find_embed_stats(embed_module, embed_fn):
+    for owner in (embed_fn, embed_module):
+        for name in ("get_last_embed_stats", "get_embed_stats"):
+            candidate = getattr(owner, name, None)
+            if callable(candidate):
+                return candidate()
+        for name in ("last_embed_stats", "LAST_EMBED_STATS", "embed_stats", "EMBED_STATS"):
+            if hasattr(owner, name):
+                return getattr(owner, name)
+    return None
+
+
+def _print_embed_stats(stats):
+    print("Embed retry stats:", flush=True)
+    if stats is None:
+        print("  unavailable: public embed stats API was not found", flush=True)
+        return
+
+    if dataclasses.is_dataclass(stats):
+        stats = dataclasses.asdict(stats)
+
+    passes = _stats_value(stats, "passes")
+    if not passes:
+        print(f"  {stats}", flush=True)
+        return
+
+    total_attempts = sum(_stats_value(p, "attempts", 0) for p in passes)
+    total_successes = sum(_stats_value(p, "successes", 0) for p in passes)
+    total_written = sum(_stats_value(p, "conformers_written", 0) for p in passes)
+    print(f"  passes:             {len(passes):,}", flush=True)
+    print(f"  attempts:           {total_attempts:,}", flush=True)
+    print(f"  successful attempts:{total_successes:>10,}", flush=True)
+    print(f"  conformers written: {total_written:,}", flush=True)
+    print("  per pass:", flush=True)
+    print("    pass  attempts  mols  successes  written  context_s  pipeline_s  writeback_s", flush=True)
+    for i, pass_stats in enumerate(passes, start=1):
+        pass_index = _stats_value(pass_stats, "pass_index", i)
+        print(
+            f"    {pass_index:>4}  "
+            f"{_stats_value(pass_stats, 'attempts', 0):>8,}  "
+            f"{_stats_value(pass_stats, 'unique_mols', 0):>4,}  "
+            f"{_stats_value(pass_stats, 'successes', 0):>9,}  "
+            f"{_stats_value(pass_stats, 'conformers_written', 0):>7,}  "
+            f"{_stats_value(pass_stats, 'context_seconds', 0.0):>9.2f}  "
+            f"{_stats_value(pass_stats, 'pipeline_seconds', 0.0):>10.2f}  "
+            f"{_stats_value(pass_stats, 'writeback_seconds', 0.0):>10.2f}",
+            flush=True,
+        )
+
+
+def bench_mlx_gpu(mols, confs_per_mol, print_embed_stats=False):
+    import mlxmolkit.embed_molecules as embed_module
     from mlxmolkit.mmff_optimize import MMFFOptimizeMoleculesConfs
 
     mlx_mols = [Chem.Mol(m) for m in mols]
@@ -80,8 +140,10 @@ def bench_mlx_gpu(mols):
     embed_params = rdDistGeom.ETKDGv3()
     embed_params.useRandomCoords = True
     embed_params.randomSeed = 42
-    EmbedMolecules(mlx_mols, embed_params, confsPerMolecule=CONFS_PER_MOL)
+    embed_module.EmbedMolecules(mlx_mols, embed_params, confsPerMolecule=confs_per_mol)
     t_embed = time.perf_counter() - t0
+    if print_embed_stats:
+        _print_embed_stats(_find_embed_stats(embed_module, embed_module.EmbedMolecules))
 
     # Phase 2+3: MMFF optimization (GPU, auto-chunked)
     t1 = time.perf_counter()
@@ -95,8 +157,30 @@ def bench_mlx_gpu(mols):
     return total_elapsed, t_embed, 0.0, t_mmff, total_confs, total_atoms
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--num-mols",
+        type=int,
+        default=100,
+        help="number of valid molecules to benchmark",
+    )
+    parser.add_argument(
+        "--mlx-only",
+        action="store_true",
+        help="run only the mlxmolkit GPU path and skip RDKit CPU",
+    )
+    parser.add_argument(
+        "--embed-stats",
+        action="store_true",
+        help="print embed retry stats when exposed by the public API",
+    )
+    return parser.parse_args()
+
+
 def main():
-    mols = load_molecules()[:100]
+    args = parse_args()
+    mols = load_molecules()[: args.num_mols]
     n_mols = len(mols)
 
     print("=" * 78)
@@ -106,7 +190,10 @@ def main():
     print(f"  Molecules:       {n_mols}")
     print(f"  Confs/molecule:  {CONFS_PER_MOL}")
     print(f"  Expected confs:  {n_mols * CONFS_PER_MOL:,}")
-    print(f"  RDKit workers:   {N_CPU}")
+    if args.mlx_only:
+        print("  RDKit workers:   skipped (--mlx-only)")
+    else:
+        print(f"  RDKit workers:   {N_CPU}")
     print()
 
     # --- Warmup Metal with a tiny batch (no embed, just kernel compile) ---
@@ -128,31 +215,50 @@ def main():
 
     # --- mlxmolkit GPU ---
     print("Running mlxmolkit GPU...", flush=True)
-    mlx_total, mlx_embed, mlx_extract, mlx_mmff, mlx_confs, mlx_atoms = bench_mlx_gpu(mols)
+    mlx_total, mlx_embed, mlx_extract, mlx_mmff, mlx_confs, mlx_atoms = bench_mlx_gpu(
+        mols,
+        confs_per_mol=CONFS_PER_MOL,
+        print_embed_stats=args.embed_stats,
+    )
     print(f"  Done in {mlx_total:.1f}s\n", flush=True)
 
     # --- RDKit CPU ---
-    print(f"Running RDKit CPU ({N_CPU} cores)...", flush=True)
-    rdk_total, rdk_confs, rdk_atoms = bench_rdkit_cpu(mols)
-    print(f"  Done in {rdk_total:.1f}s\n", flush=True)
+    if not args.mlx_only:
+        print(f"Running RDKit CPU ({N_CPU} cores)...", flush=True)
+        rdk_total, rdk_confs, rdk_atoms = bench_rdkit_cpu(mols)
+        print(f"  Done in {rdk_total:.1f}s\n", flush=True)
 
     # --- Results ---
     print("=" * 78)
-    print(f"{'':>30} {'RDKit CPU':>16} {'mlxmolkit GPU':>16}")
-    print("-" * 78)
-    print(f"{'Conformers generated':>30} {rdk_confs:>16,} {mlx_confs:>16,}")
-    print(f"{'Total atoms optimized':>30} {rdk_atoms:>16,} {mlx_atoms:>16,}")
+    if args.mlx_only:
+        print(f"{'':>30} {'mlxmolkit GPU':>16}")
+        print("-" * 78)
+        print(f"{'Conformers generated':>30} {mlx_confs:>16,}")
+        print(f"{'Total atoms optimized':>30} {mlx_atoms:>16,}")
+        print()
+        print(f"{'Embed time (s)':>30} {mlx_embed:>16.2f}")
+        print(f"{'Param extraction (s)':>30} {mlx_extract:>16.2f}")
+        print(f"{'MMFF optimization (s)':>30} {mlx_mmff:>16.2f}")
+        print(f"{'Total mlx time (s)':>30} {mlx_total:>16.2f}")
+    else:
+        print(f"{'':>30} {'RDKit CPU':>16} {'mlxmolkit GPU':>16}")
+        print("-" * 78)
+        print(f"{'Conformers generated':>30} {rdk_confs:>16,} {mlx_confs:>16,}")
+        print(f"{'Total atoms optimized':>30} {rdk_atoms:>16,} {mlx_atoms:>16,}")
+        print()
+        print(f"{'Embed time (s)':>30} {'(included)':>16} {mlx_embed:>16.2f}")
+        print(f"{'Param extraction (s)':>30} {'(included)':>16} {mlx_extract:>16.2f}")
+        print(f"{'MMFF optimization (s)':>30} {'(included)':>16} {mlx_mmff:>16.2f}")
+        print(f"{'Total wall time (s)':>30} {rdk_total:>16.2f} {mlx_total:>16.2f}")
     print()
-    print(f"{'Embed time (s)':>30} {'(included)':>16} {mlx_embed:>16.2f}")
-    print(f"{'Param extraction (s)':>30} {'(included)':>16} {mlx_extract:>16.2f}")
-    print(f"{'MMFF optimization (s)':>30} {'(included)':>16} {mlx_mmff:>16.2f}")
-    print(f"{'Total wall time (s)':>30} {rdk_total:>16.2f} {mlx_total:>16.2f}")
-    print()
-    confs_sec_rdk = rdk_confs / rdk_total if rdk_total > 0 else 0
     confs_sec_mlx = mlx_confs / mlx_total if mlx_total > 0 else 0
-    print(f"{'Throughput (confs/sec)':>30} {confs_sec_rdk:>16,.0f} {confs_sec_mlx:>16,.0f}")
-    if mlx_total > 0 and rdk_total > 0:
-        print(f"{'Speedup':>30} {'1.0x':>16} {rdk_total / mlx_total:>15.1f}x")
+    if args.mlx_only:
+        print(f"{'Throughput (confs/sec)':>30} {confs_sec_mlx:>16,.0f}")
+    else:
+        confs_sec_rdk = rdk_confs / rdk_total if rdk_total > 0 else 0
+        print(f"{'Throughput (confs/sec)':>30} {confs_sec_rdk:>16,.0f} {confs_sec_mlx:>16,.0f}")
+        if mlx_total > 0 and rdk_total > 0:
+            print(f"{'Speedup':>30} {'1.0x':>16} {rdk_total / mlx_total:>15.1f}x")
     print("=" * 78)
 
 
